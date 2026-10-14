@@ -203,4 +203,6 @@ Issues and pull requests are welcome.
 
 ## License
 
-<!-- Add a LICENSE file (e.g. MIT or Apache-2.0) and name it here. -->
+[MIT](LICENSE) © 2026 Kartik Trivedi. You are free to use, modify and
+redistribute mootui, including commercially, as long as you keep the copyright
+and license notice.

@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="480" height="480" role="img" aria-label="mootui cow logo">
+  <g stroke="#141414" stroke-width="5" stroke-linejoin="round" stroke-linecap="round">
+    <!-- horns -->
+    <path d="M80 62 C66 46 68 30 82 22 C82 36 88 48 98 55 Z" fill="#F3E3C3"/>
+    <path d="M160 62 C174 46 172 30 158 22 C158 36 152 48 142 55 Z" fill="#F3E3C3"/>
+    <!-- ears -->
+    <ellipse cx="50" cy="96" rx="28" ry="15" transform="rotate(-25 50 96)" fill="#F7F5EF"/>
+    <ellipse cx="52" cy="96" rx="15" ry="7" transform="rotate(-25 52 96)" fill="#F4A6B8" stroke="none"/>
+    <ellipse cx="190" cy="96" rx="28" ry="15" transform="rotate(25 190 96)" fill="#F7F5EF"/>
+    <ellipse cx="188" cy="96" rx="15" ry="7" transform="rotate(25 188 96)" fill="#F4A6B8" stroke="none"/>
+    <!-- head -->
+    <path d="M120 44 C170 44 188 74 188 108 C188 140 172 160 120 160 C68 160 52 140 52 108 C52 74 70 44 120 44 Z" fill="#F7F5EF"/>
+    <!-- files being chewed: drawn behind the muzzle so half sits inside the mouth -->
+    <g transform="translate(176 168) rotate(62) translate(-20 -26)">
+      <path d="M0 0 H28 L40 12 V52 H0 Z" fill="#E6E9EE"/>
+    </g>
+    <g transform="translate(174 160) rotate(78) translate(-20 -26)">
+      <path d="M0 0 H28 L40 12 V52 H0 Z" fill="#FFFFFF"/>
+      <path d="M28 0 V12 H40" fill="none"/>
+      <path d="M8 22 H32 M8 31 H32 M8 40 H24" stroke="#9AA3AE" stroke-width="3.5"/>
+    </g>
+    <!-- goofy cross-eyes: small low brow on the left, big raised brow on the right -->
+    <circle cx="96" cy="110" r="15" fill="#FFFFFF"/>
+    <circle cx="102" cy="113" r="7" fill="#141414" stroke="none"/>
+    <circle cx="146" cy="107" r="19" fill="#FFFFFF"/>
+    <circle cx="137" cy="112" r="8.5" fill="#141414" stroke="none"/>
+    <path d="M130 80 Q146 70 162 80" fill="none"/>
+    <path d="M88 84 Q98 79 108 84" fill="none" stroke-width="4"/>
+    <!-- eyelashes on the outer upper corner of each eye -->
+    <path d="M81.0 104.5 L74.4 102.1 M84.1 99.3 L78.9 94.6 M89.0 95.6 L85.9 89.3" fill="none" stroke-width="3.5"/>
+    <path d="M158.9 91.7 L164.0 85.6 M163.3 97.0 L170.2 93.0 M165.7 103.5 L173.6 102.1" fill="none" stroke-width="3.5"/>
+    <!-- muzzle -->
+    <ellipse cx="120" cy="146" rx="54" ry="32" fill="#F4A6B8"/>
+    <ellipse cx="100" cy="140" rx="7" ry="9.5" transform="rotate(-15 100 140)" fill="#6B2A3A" stroke="none"/>
+    <ellipse cx="140" cy="140" rx="7" ry="9.5" transform="rotate(15 140 140)" fill="#6B2A3A" stroke="none"/>
+    <!-- chewing grin running to the corner that grips the file -->
+    <path d="M96 160 Q128 172 168 157" fill="none"/>
+  </g>
+  <circle cx="104" cy="110" r="2.4" fill="#FFFFFF"/>
+  <circle cx="140" cy="109" r="2.8" fill="#FFFFFF"/>
+</svg>

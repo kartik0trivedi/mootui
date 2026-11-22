@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/mootui-cow.svg" alt="mootui logo: a cross-eyed cow chewing on files" width="160">
+</p>
+
 # mootui — photo importer for the terminal (macOS)
 
 **mootui** is a fast, keyboard-driven terminal app (TUI) for **importing photos and videos from a camera SD card** or any folder into a dated photo library. It **skips duplicates**, **organizes files into folders by date**, keeps RAW + JPEG pairs and sidecars together, and can **tidy an existing messy photo folder**. Every move is logged and can be undone.

@@ -1,0 +1,78 @@
+# On a version tag (v0.3.0, ...): build mootui as one universal binary (Apple
+# Silicon + Intel), publish a GitHub release with it, and update the Homebrew tap
+# (kartik0trivedi/homebrew-tap) when the TAP_TOKEN secret is set.
+#
+#   1. bump `version` in Cargo.toml, commit, push
+#   2. git tag v0.3.0 && git push origin v0.3.0
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$t"
+          done
+
+      - name: Package (one universal binary for Apple Silicon and Intel)
+        run: |
+          mkdir dist
+          d="mootui-$GITHUB_REF_NAME-universal-apple-darwin"
+          mkdir "$d"
+          lipo -create -output "$d/mootui" \
+            target/aarch64-apple-darwin/release/mootui \
+            target/x86_64-apple-darwin/release/mootui
+          "$d/mootui" --help > /dev/null
+          cp LICENSE README.md "$d/"
+          tar -czf "dist/$d.tar.gz" "$d"
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "mootui ${GITHUB_REF_NAME#v}" --generate-notes
+
+      - name: Update Homebrew tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sha=$(awk '{print $1}' dist/SHA256SUMS)
+          url="https://github.com/kartik0trivedi/mootui/releases/download/$GITHUB_REF_NAME/mootui-$GITHUB_REF_NAME-universal-apple-darwin.tar.gz"
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/kartik0trivedi/homebrew-tap.git" tap
+          f=tap/Formula/mootui.rb
+          sed -i '' -E "s|^  url \".*\"|  url \"$url\"|; s|^  sha256 \".*\"|  sha256 \"$sha\"|" "$f"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "mootui $v"
+          git push

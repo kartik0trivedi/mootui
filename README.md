@@ -4,8 +4,6 @@
 
 Think of it as the import step of Lightroom, Photos or digiKam, in a single small binary that you run from the terminal. It does no editing and no cataloguing UI, and it leaves your files as plain folders that any app can read.
 
-![mootui screenshot](docs/screenshot.png)
-
 ## Why mootui?
 
 - **No duplicate imports.** Re-insert the same card as often as you like; only new shots are copied. Duplicates are detected by filename, size and capture time (as Lightroom does) or, optionally, by file content even after renaming.
@@ -20,30 +18,42 @@ Supported formats include RAW (`.NEF`, `.CR2`, `.CR3`, `.ARW`, `.RAF`, `.DNG`, `
 
 ## Installation
 
-mootui runs on **macOS**. It uses `diskutil` to detect and eject cards and the macOS Trash for removed duplicates.
+mootui runs on **macOS** (Apple Silicon and Intel). It uses `diskutil` to detect and eject cards and the macOS Trash for removed duplicates.
 
-### Requirements
-
-- [Rust](https://rustup.rs) (stable)
-- [ExifTool](https://exiftool.org), recommended for accurate capture dates: `brew install exiftool`
-
-### Install with cargo
+### Homebrew (recommended)
 
 ```sh
-cargo install --git https://github.com/OWNER/mootui
+brew install kartik0trivedi/tap/mootui
+```
+
+This installs a ready-made binary, so you don't need Rust, and also installs [ExifTool](https://exiftool.org), which mootui uses for accurate capture dates. Update with `brew upgrade mootui`.
+
+### Download a release
+
+Download `mootui-vX.Y.Z-universal-apple-darwin.tar.gz` from [Releases](https://github.com/kartik0trivedi/mootui/releases), then:
+
+```sh
+tar -xzf mootui-v*-universal-apple-darwin.tar.gz
+cd mootui-v*-universal-apple-darwin
+xattr -d com.apple.quarantine mootui    # the binary isn't notarized; this lets macOS run it
+mv mootui ~/.local/bin/                 # or any directory on your PATH
+brew install exiftool                   # recommended, for accurate capture dates
 ```
 
 ### Build from source
 
+Requires [Rust](https://rustup.rs) (stable).
+
 ```sh
-git clone https://github.com/OWNER/mootui
+git clone https://github.com/kartik0trivedi/mootui
 cd mootui
 cargo build --release
 cp target/release/mootui ~/.local/bin/   # or any directory on your PATH
-mootui --help
 ```
 
-The binary is self-contained. After installing it you can delete the source folder; your catalog and logs live inside your photo library.
+Or in one step: `cargo install --git https://github.com/kartik0trivedi/mootui`.
+
+The binary is self-contained. Your catalog and logs live inside your photo library, not next to the binary.
 
 ## Quick start
 

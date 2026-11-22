@@ -16,4 +16,5 @@ chrono = "0.4"
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rayon = "1"
+libc = "0.2"
 unicode-normalization = "0.1"

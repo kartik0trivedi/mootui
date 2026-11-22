@@ -2,8 +2,10 @@
 //!
 //! Import: a reader thread streams the card into a small bounded queue while
 //! this thread hashes and writes, so the card never idles waiting for a write.
-//! Each copy is verified (re-read and hashed) before it is renamed into place
-//! and recorded in the catalog. Move mode deletes the source only after that.
+//! A finisher thread then fsyncs, verifies (re-read and hash) and renames each
+//! copy into place and records it in the catalog, in batched transactions.
+//! One full drive flush per batch (Move mode) and at the end of the run; Move
+//! mode deletes a source only after its batch is flushed.
 //!
 //! Tidy/Reorganize: renames inside the library, each recorded so the whole
 //! run can be undone. Duplicates are only moved to the Trash when asked.
@@ -81,8 +83,8 @@ pub enum XferMsg {
 }
 
 const CHUNK: usize = 8 << 20;
-/// Chunks buffered between reader and writer: 4 x 8 MB.
-const QUEUE: usize = 4;
+/// Chunks buffered between reader and writer: 8 x 8 MB.
+const QUEUE: usize = 8;
 
 pub fn run(plan: Plan, mode: Mode, backup_dir: Option<PathBuf>, cancel: Arc<AtomicBool>, tx: Sender<XferMsg>) {
     let r = match plan.kind {
@@ -264,7 +266,7 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
     let to_read: Vec<PathBuf> = new.iter().zip(&renames).filter(|(_, r)| !**r).map(|(i, _)| i.src.clone()).collect();
     let rx = spawn_reader(to_read, cancel_arc.clone());
 
-    let mut s = Summary {
+    let s = Summary {
         kind: Kind::Import,
         mode,
         transferred: 0,
@@ -281,64 +283,38 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
         note: None,
     };
 
-    let mut bytes_done = 0u64;
-    for (k, item) in new.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            cancel_arc.store(true, Ordering::Relaxed);
-            s.cancelled = true;
-            log.line("CANCELLED", &format!("{} file(s) not transferred", new.len() - k));
-            break;
+    let (ftx, frx) = sync_channel::<Written>(FINISH_QUEUE);
+    let (cat, mut log, s) = thread::scope(|sc| {
+        let fin = Finisher { new: &new, mode, cat, log, s, import_id, tx, open_tx: false, rows: 0, pending: Vec::new(), last: None };
+        let handle = sc.spawn(move || fin.run(frx));
+
+        // Writer: stream each file to its temp path and hand it on. Flushing,
+        // verifying and cataloguing happen on the finisher, so this loop keeps
+        // draining the reader queue.
+        let mut bytes_done = 0u64;
+        for (k, item) in new.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                cancel_arc.store(true, Ordering::Relaxed);
+                let _ = ftx.send(Written::Cancelled { remaining: new.len() - k });
+                break;
+            }
+            let base = bytes_done;
+            let send = |n: u64, phase: &'static str| {
+                let _ = tx.send(XferMsg::Progress { files_done: k, bytes_done: base + n, current: item.name.clone(), phase });
+            };
+            send(0, if renames[k] { "moving" } else { "copying" });
+            let w = if renames[k] { Written::Done { k, result: rename_in(item), copied: false } } else { copy_in(k, item, &rx, &send) };
+            bytes_done = base + item.size;
+            if ftx.send(w).is_err() {
+                break;
+            }
         }
-        let base = bytes_done;
-        let send = |n: u64, phase: &'static str| {
-            let _ = tx.send(XferMsg::Progress { files_done: k, bytes_done: base + n, current: item.name.clone(), phase });
-        };
-        send(0, if renames[k] { "moving" } else { "copying" });
+        drop(ftx);
+        drop(rx);
+        handle.join().expect("finisher thread panicked")
+    });
 
-        let r = if renames[k] { rename_in(item) } else { copy_in(item, &rx, &send) };
-        bytes_done = base + item.size;
-
-        let (tag, text) = match r {
-            Ok((head, full)) => {
-                let rec = cat.upsert(&NewRow {
-                    rel: &item.rel_dest,
-                    size: item.size,
-                    mtime: item.mtime,
-                    name: &item.name,
-                    capture: Some(&item.capture).filter(|c| !c.is_empty()).map(|c| c.as_str()),
-                    date_src: Some(&item.date_src),
-                    camera: item.camera.as_deref(),
-                    head: head.as_ref().map(|h| &h[..]),
-                    full: full.as_ref().map(|h| &h[..]),
-                    import_id: Some(import_id),
-                });
-                s.transferred += 1;
-                s.bytes += item.size;
-                let mut warn = rec.err().map(|e| format!("catalog: {e}"));
-                if mode == Mode::Move && !renames[k] {
-                    if let Err(e) = fs::remove_file(&item.src) {
-                        warn = Some(format!("could not delete source: {e}"));
-                    }
-                }
-                match warn {
-                    Some(w) => {
-                        s.warnings += 1;
-                        ("WARNING", format!("{}  ->  {}  ({w})", item.src.display(), item.rel_dest))
-                    }
-                    None => (if mode == Mode::Move { "MOVED" } else { "COPIED" }, format!("{}  ->  {}", item.src.display(), item.rel_dest)),
-                }
-            }
-            Err(e) => {
-                s.failed += 1;
-                ("FAILED", format!("{}  ->  {}  ({e})", item.src.display(), item.rel_dest))
-            }
-        };
-        log.line(tag, &text);
-        let _ = tx.send(XferMsg::Line(format!("{tag:<9} {text}")));
-    }
-    drop(rx);
-    let _ = tx.send(XferMsg::Progress { files_done: s.transferred + s.failed, bytes_done, current: String::new(), phase: "done" });
-
+    let _ = tx.send(XferMsg::Progress { files_done: s.transferred + s.failed, bytes_done: s.bytes, current: String::new(), phase: "done" });
     footer(&mut log, &s);
     cat.finish_import(
         import_id,
@@ -352,6 +328,154 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
 
 type Hashes = (Option<[u8; 32]>, Option<[u8; 32]>);
 
+/// Files handed from the writer to the finisher, in plan order.
+enum Written {
+    /// Fully streamed to `tmp`; still to be flushed, verified and renamed.
+    Copied { k: usize, tmp: PathBuf, file: File, hash: [u8; 32] },
+    /// Already settled: a same-disk rename, or a copy that failed.
+    Done { k: usize, result: Result<Hashes, String>, copied: bool },
+    Cancelled { remaining: usize },
+}
+
+/// Copied files waiting in the finisher queue (each holds an open file, no data).
+const FINISH_QUEUE: usize = 16;
+/// Catalog rows per transaction; in Move mode also how many sources wait
+/// for one full drive flush before they are deleted.
+const BATCH: usize = 64;
+
+/// An outcome not yet written to the log. Move mode holds these until the
+/// batch is durable, then deletes the sources; Copy mode emits them at once.
+struct Pending {
+    k: usize,
+    outcome: Result<Option<String>, String>,
+    delete_source: bool,
+}
+
+struct Finisher<'a> {
+    new: &'a [&'a Item],
+    mode: Mode,
+    cat: Catalog,
+    log: Log,
+    s: Summary,
+    import_id: i64,
+    tx: &'a Sender<XferMsg>,
+    open_tx: bool,
+    rows: usize,
+    pending: Vec<Pending>,
+    /// Most recent copy, kept open so one F_FULLFSYNC on it flushes the
+    /// drive cache for everything fsync'd before it.
+    last: Option<File>,
+}
+
+impl Finisher<'_> {
+    fn run(mut self, rx: Receiver<Written>) -> (Catalog, Log, Summary) {
+        for w in rx {
+            match w {
+                Written::Copied { k, tmp, file, hash } => {
+                    let r = finish_copy(self.new[k], &tmp, &file, hash);
+                    if r.is_err() {
+                        let _ = fs::remove_file(&tmp);
+                    } else {
+                        self.last = Some(file);
+                    }
+                    self.record(k, r, true);
+                }
+                Written::Done { k, result, copied } => self.record(k, result, copied),
+                Written::Cancelled { remaining } => {
+                    self.flush(false);
+                    self.s.cancelled = true;
+                    self.log.line("CANCELLED", &format!("{remaining} file(s) not transferred"));
+                }
+            }
+        }
+        self.flush(true);
+        (self.cat, self.log, self.s)
+    }
+
+    fn record(&mut self, k: usize, r: Result<Hashes, String>, copied: bool) {
+        let item = self.new[k];
+        let outcome = r.map(|(head, full)| {
+            if !self.open_tx {
+                self.open_tx = self.cat.conn.execute_batch("BEGIN").is_ok();
+            }
+            let rec = self.cat.upsert(&NewRow {
+                rel: &item.rel_dest,
+                size: item.size,
+                mtime: item.mtime,
+                name: &item.name,
+                capture: Some(&item.capture).filter(|c| !c.is_empty()).map(|c| c.as_str()),
+                date_src: Some(&item.date_src),
+                camera: item.camera.as_deref(),
+                head: head.as_ref().map(|h| &h[..]),
+                full: full.as_ref().map(|h| &h[..]),
+                import_id: Some(self.import_id),
+            });
+            self.rows += 1;
+            self.s.transferred += 1;
+            self.s.bytes += item.size;
+            rec.err().map(|e| format!("catalog: {e}"))
+        });
+        self.pending.push(Pending { k, delete_source: self.mode == Mode::Move && copied && outcome.is_ok(), outcome });
+        if self.mode == Mode::Copy {
+            self.emit(true);
+        }
+        if self.rows >= BATCH {
+            self.flush(false);
+        }
+    }
+
+    /// Make the batch durable (Move mode, or the end of the run), commit the
+    /// catalog, then delete sources and write the held log lines.
+    fn flush(&mut self, end: bool) {
+        let mut durable = true;
+        if end || self.pending.iter().any(|p| p.delete_source) {
+            if let Some(f) = self.last.take() {
+                // std's sync_all is F_FULLFSYNC on macOS: flushes the drive cache.
+                durable = f.sync_all().is_ok();
+            }
+        }
+        if self.open_tx {
+            if let Err(e) = self.cat.conn.execute_batch("COMMIT") {
+                self.s.warnings += 1;
+                self.log.line("WARNING", &format!("catalog commit failed: {e}"));
+            }
+            self.open_tx = false;
+        }
+        self.rows = 0;
+        self.emit(durable);
+    }
+
+    fn emit(&mut self, durable: bool) {
+        for p in std::mem::take(&mut self.pending) {
+            let item = self.new[p.k];
+            let (tag, text) = match p.outcome {
+                Ok(mut warn) => {
+                    if p.delete_source {
+                        if !durable {
+                            warn = Some("flush to disk failed; source kept".into());
+                        } else if let Err(e) = fs::remove_file(&item.src) {
+                            warn = Some(format!("could not delete source: {e}"));
+                        }
+                    }
+                    match warn {
+                        Some(w) => {
+                            self.s.warnings += 1;
+                            ("WARNING", format!("{}  ->  {}  ({w})", item.src.display(), item.rel_dest))
+                        }
+                        None => (if self.mode == Mode::Move { "MOVED" } else { "COPIED" }, format!("{}  ->  {}", item.src.display(), item.rel_dest)),
+                    }
+                }
+                Err(e) => {
+                    self.s.failed += 1;
+                    ("FAILED", format!("{}  ->  {}  ({e})", item.src.display(), item.rel_dest))
+                }
+            };
+            self.log.line(tag, &text);
+            let _ = self.tx.send(XferMsg::Line(format!("{tag:<9} {text}")));
+        }
+    }
+}
+
 fn rename_in(item: &Item) -> Result<Hashes, String> {
     let dir = item.dest.parent().ok_or("bad destination")?;
     fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -364,8 +488,12 @@ fn rename_in(item: &Item) -> Result<Hashes, String> {
 
 /// Consume exactly one file's chunks from the reader, even on error, so the
 /// stream stays aligned with the item list.
-fn copy_in(item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) -> Result<Hashes, String> {
-    let dir = item.dest.parent().ok_or("bad destination")?;
+fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) -> Written {
+    let Some(dir) = item.dest.parent() else {
+        // Still drain this file's chunks.
+        while let Ok(Chunk::Data(_)) = rx.recv() {}
+        return Written::Done { k, result: Err("bad destination".into()), copied: true };
+    };
     let tmp = dir.join(format!(".{}.mootui-partial", item.name));
     let mut err: Option<String> = None;
     let mut w = match fs::create_dir_all(dir) {
@@ -415,26 +543,17 @@ fn copy_in(item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) 
         }
     }
 
-    let r = finish_copy(item, &tmp, err, w, h, n, send);
-    if r.is_err() {
-        let _ = fs::remove_file(&tmp);
+    match (err, w) {
+        (None, Some(file)) => Written::Copied { k, tmp, file, hash: *h.finalize().as_bytes() },
+        (err, _) => {
+            let _ = fs::remove_file(&tmp);
+            Written::Done { k, result: Err(err.unwrap_or_else(|| "no file".into())), copied: true }
+        }
     }
-    r
 }
 
-fn finish_copy(
-    item: &Item,
-    tmp: &Path,
-    err: Option<String>,
-    w: Option<File>,
-    h: blake3::Hasher,
-    n: u64,
-    send: &dyn Fn(u64, &'static str),
-) -> Result<Hashes, String> {
-    if let Some(e) = err {
-        return Err(e);
-    }
-    let f = w.ok_or("no file")?;
+/// Runs on the finisher thread: copy times, fsync, verify, rename into place.
+fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32]) -> Result<Hashes, String> {
     if let Ok(meta) = fs::metadata(&item.src) {
         let mut times = fs::FileTimes::new();
         if let Ok(t) = meta.modified() {
@@ -450,11 +569,8 @@ fn finish_copy(
         }
         let _ = f.set_times(times);
     }
-    f.sync_all().map_err(|e| format!("sync: {e}"))?;
-    drop(f);
+    fsync(f).map_err(|e| format!("sync: {e}"))?;
 
-    send(n, "verifying");
-    let streamed = *h.finalize().as_bytes();
     let written = hash_file(tmp).map_err(|e| format!("verify: {e}"))?;
     if streamed != written || item.full.is_some_and(|f| f != streamed) {
         return Err("verification failed: copy does not match source".into());
@@ -465,6 +581,19 @@ fn finish_copy(
     }
     fs::rename(tmp, &item.dest).map_err(|e| format!("rename: {e}"))?;
     Ok((head, Some(streamed)))
+}
+
+/// Plain fsync(2): hands the data to the drive. Unlike std's sync_all on
+/// macOS it does not also flush the drive's cache (F_FULLFSYNC), which is
+/// slow per file; Finisher::flush does that once per batch instead.
+fn fsync(f: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fd is valid for the lifetime of `f`.
+    if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 // ---------------------------------------------------------------------------

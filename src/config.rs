@@ -60,11 +60,14 @@ pub struct AppConfig {
     /// Extra place to keep catalog backups (e.g. a cloud-synced folder).
     /// A finished backup file is safe to sync; the live catalog is not.
     pub backup_dir: String,
+    /// Imports also write a verified copy of every file here, in the same
+    /// layout (e.g. a folder on a backup drive). Empty for none.
+    pub second_copy: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        AppConfig { library: "~/Pictures".into(), mode: "copy".into(), backup_dir: String::new() }
+        AppConfig { library: "~/Pictures".into(), mode: "copy".into(), backup_dir: String::new(), second_copy: String::new() }
     }
 }
 
@@ -85,6 +88,9 @@ impl AppConfig {
     }
     pub fn backup_path(&self) -> Option<PathBuf> {
         (!self.backup_dir.trim().is_empty()).then(|| clean_typed_path(&self.backup_dir))
+    }
+    pub fn second_copy_path(&self) -> Option<PathBuf> {
+        (!self.second_copy.trim().is_empty()).then(|| clean_typed_path(&self.second_copy))
     }
 }
 

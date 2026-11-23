@@ -107,6 +107,8 @@ struct Args {
     trash: bool,
     undo: bool,
     index: bool,
+    second_copy: Option<PathBuf>,
+    no_second_copy: bool,
 }
 
 const HELP: &str = "mootui -- import photos into a catalogued library, skipping duplicates
@@ -115,6 +117,8 @@ usage:
   mootui [--library DIR] [SOURCE]           interactive
   mootui --plan SOURCE                      preview an import, change nothing
   mootui --yes [--move] [--verify] SOURCE   import without the UI (default: copy)
+        [--second-copy DIR | --no-second-copy]  also write a verified copy to DIR
+                                            (default: the Second copy setting)
   mootui --tidy [--yes] [--trash]           sort loose files already in the library
   mootui --reorganize [--yes]               re-sort the whole library to its layout
   mootui --undo                             undo the last tidy/reorganize
@@ -139,6 +143,8 @@ fn parse_args() -> Result<Args> {
             "--trash" => a.trash = true,
             "--undo" => a.undo = true,
             "--index" => a.index = true,
+            "--second-copy" => a.second_copy = Some(clean_typed_path(&it.next().unwrap_or_default())),
+            "--no-second-copy" => a.no_second_copy = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -267,7 +273,11 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
     let mode = if args.mv { Mode::Move } else { Mode::Copy };
     let (tx, rx) = mpsc::channel();
     let backup = app_cfg.backup_path();
-    thread::spawn(move || transfer::run(plan, mode, backup, Arc::new(AtomicBool::new(false)), tx));
+    let second = if args.no_second_copy { None } else { args.second_copy.clone().or_else(|| app_cfg.second_copy_path()) };
+    if let Some(sec) = &second {
+        println!("second copy: {}", tilde(sec));
+    }
+    thread::spawn(move || transfer::run(plan, mode, backup, second, Arc::new(AtomicBool::new(false)), tx));
     loop {
         match rx.recv()? {
             XferMsg::Line(l) => println!("  {l}"),
@@ -308,7 +318,10 @@ fn summary_line(s: &Summary) -> String {
         if s.trashed > 0 { format!(" ({} to Trash)", s.trashed) } else { String::new() },
         s.conflicts,
         if s.cancelled { " — CANCELLED" } else { "" }
-    )
+    ) + &match &s.second {
+        Some(sec) => format!("; second copy in {} ({} failed)", tilde(sec), s.second_failed),
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +345,7 @@ enum InputFor {
     Source,
     Library,
     BackupDir,
+    SecondCopy,
 }
 
 #[derive(Clone, Copy)]
@@ -600,7 +614,8 @@ impl App {
         let cancel = self.cancel.clone();
         let mode = self.mode;
         let backup = self.app_cfg.backup_path();
-        thread::spawn(move || transfer::run(plan, mode, backup, cancel, tx));
+        let second = self.app_cfg.second_copy_path();
+        thread::spawn(move || transfer::run(plan, mode, backup, second, cancel, tx));
         self.xfer_rx = Some(rx);
         self.files_done = 0;
         self.bytes_done = 0;
@@ -786,7 +801,11 @@ impl App {
 
     fn begin_input(&mut self, purpose: InputFor) {
         self.input_for = purpose;
-        self.input = if purpose == InputFor::BackupDir { self.app_cfg.backup_dir.clone() } else { String::new() };
+        self.input = match purpose {
+            InputFor::BackupDir => self.app_cfg.backup_dir.clone(),
+            InputFor::SecondCopy => self.app_cfg.second_copy.clone(),
+            _ => String::new(),
+        };
         self.message = None;
         self.screen = Screen::Input;
     }
@@ -835,7 +854,7 @@ impl App {
             KeyCode::Esc => {
                 self.screen = match self.input_for {
                     InputFor::Source => Screen::Pick,
-                    InputFor::BackupDir => Screen::Settings,
+                    InputFor::BackupDir | InputFor::SecondCopy => Screen::Settings,
                     InputFor::Library if self.lib.is_some() => Screen::Pick,
                     InputFor::Library => Screen::Init,
                 }
@@ -857,6 +876,11 @@ impl App {
                         let _ = self.app_cfg.save();
                         self.screen = Screen::Settings;
                     }
+                    InputFor::SecondCopy => {
+                        self.app_cfg.second_copy = if text.is_empty() { String::new() } else { tilde(&clean_typed_path(&text)) };
+                        let _ = self.app_cfg.save();
+                        self.screen = Screen::Settings;
+                    }
                 }
             }
             KeyCode::Char(c) => self.input.push(c),
@@ -864,7 +888,7 @@ impl App {
         }
     }
 
-    const SETTINGS: usize = 6;
+    const SETTINGS: usize = 7;
 
     fn key_settings(&mut self, k: KeyEvent) {
         let n = Self::SETTINGS;
@@ -880,6 +904,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.settings_sel = (self.settings_sel + 1) % n,
             KeyCode::Enter if self.settings_sel == 0 => self.begin_input(InputFor::Library),
             KeyCode::Enter if self.settings_sel == 5 => self.begin_input(InputFor::BackupDir),
+            KeyCode::Enter if self.settings_sel == 6 => self.begin_input(InputFor::SecondCopy),
             _ if step != 0 => match self.settings_sel {
                 1 => {
                     if let Some(l) = self.lib.as_mut() {
@@ -1176,6 +1201,7 @@ impl App {
             InputFor::Source => ("Import from folder", "Type a path, or drag a folder from Finder into this window:"),
             InputFor::Library => ("Library folder", "Folder to import into; it becomes the default. Type or drag a folder:"),
             InputFor::BackupDir => ("Extra catalog backup folder", "e.g. a Google Drive folder. Leave empty for none:"),
+            InputFor::SecondCopy => ("Second copy folder", "Imports also write a verified copy of every photo here, e.g. a backup drive. Leave empty for none:"),
         };
         let p = Paragraph::new(vec![
             Line::from(Span::styled(hint, Style::new().dark_gray())),
@@ -1202,7 +1228,12 @@ impl App {
             (
                 "Extra backup folder",
                 if self.app_cfg.backup_dir.is_empty() { "none".into() } else { self.app_cfg.backup_dir.clone() },
-                "enter to change",
+                "enter to change · catalog backups only",
+            ),
+            (
+                "Second copy",
+                if self.app_cfg.second_copy.is_empty() { "none".into() } else { self.app_cfg.second_copy.clone() },
+                "enter to change · imports copy every photo here too",
             ),
         ];
         let mut lines = vec![Line::from("")];
@@ -1278,7 +1309,12 @@ impl App {
             } else {
                 "  verified copy, source untouched"
             };
-            lines.push(Line::from(vec![Span::raw(" mode "), Span::styled(format!(" {} ", self.mode.label()), ms), Span::styled(note, Style::new().dark_gray())]));
+            let second = self.app_cfg.second_copy_path().map(|p| format!(" · second copy → {}", tilde(&p))).unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::raw(" mode "),
+                Span::styled(format!(" {} ", self.mode.label()), ms),
+                Span::styled(format!("{note}{second}"), Style::new().dark_gray()),
+            ]));
             let dn = match plan.dup_mode {
                 DupMode::Suspected => "  same original name + size + capture time as a catalogued file",
                 DupMode::Verified => "  identical content (hash) to a catalogued file, even if renamed",
@@ -1444,6 +1480,14 @@ impl App {
             }
             if s.warnings > 0 {
                 lines.push(Line::from(Span::styled(format!("  {} warning(s) — see log", s.warnings), Style::new().fg(Color::Yellow))));
+            }
+            if let Some(sec) = &s.second {
+                let line = if s.second_failed > 0 {
+                    Span::styled(format!("  second copy: {} failed — see log ({})", s.second_failed, tilde(sec)), Style::new().fg(Color::Yellow))
+                } else {
+                    Span::raw(format!("  second copy in {}", tilde(sec)))
+                };
+                lines.push(Line::from(line));
             }
             let dup_note = if s.kind == Kind::Import { ", left on source" } else { "" };
             let trash = if s.trashed > 0 { format!(", {} moved to Trash", s.trashed) } else { String::new() };

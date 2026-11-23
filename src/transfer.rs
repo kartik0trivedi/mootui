@@ -74,6 +74,10 @@ pub struct Summary {
     pub log_path: PathBuf,
     pub csv_path: Option<PathBuf>,
     pub note: Option<String>,
+    /// Import: the second-copy folder, if one was made.
+    pub second: Option<PathBuf>,
+    /// Files whose second copy failed (they are in the library).
+    pub second_failed: usize,
 }
 
 pub enum XferMsg {
@@ -86,9 +90,9 @@ const CHUNK: usize = 8 << 20;
 /// Chunks buffered between reader and writer: 8 x 8 MB.
 const QUEUE: usize = 8;
 
-pub fn run(plan: Plan, mode: Mode, backup_dir: Option<PathBuf>, cancel: Arc<AtomicBool>, tx: Sender<XferMsg>) {
+pub fn run(plan: Plan, mode: Mode, backup_dir: Option<PathBuf>, second: Option<PathBuf>, cancel: Arc<AtomicBool>, tx: Sender<XferMsg>) {
     let r = match plan.kind {
-        Kind::Import => import(&plan, mode, &cancel, &tx),
+        Kind::Import => import(&plan, mode, second.as_deref(), &cancel, &tx),
         Kind::Tidy | Kind::Reorganize => reconcile(&plan, &cancel, &tx),
     };
     let r = r.map(|mut s| {
@@ -153,13 +157,16 @@ fn write_dup_csv(plan: &Plan, stamp: &str, trashed: &[PathBuf]) -> Result<Option
     Ok(Some(p))
 }
 
-fn header(log: &mut Log, plan: &Plan, mode: &str) {
+fn header(log: &mut Log, plan: &Plan, mode: &str, second: Option<&Path>) {
     log.raw(&format!("mootui {} log", plan.kind.key()));
     log.raw(&format!("started    {}", now()));
     log.raw(&format!("source     {}", plan.source.display()));
     log.raw(&format!("library    {}", plan.root.display()));
     log.raw(&format!("layout     {}", plan.layout));
     log.raw(&format!("mode       {mode}"));
+    if let Some(sec) = second {
+        log.raw(&format!("2nd copy   {}", sec.display()));
+    }
     if plan.kind == Kind::Import {
         log.raw(&format!("duplicates {}", plan.dup_mode.label()));
     }
@@ -203,6 +210,9 @@ fn footer(log: &mut Log, s: &Summary) {
         s.conflicts,
         if s.cancelled { ", CANCELLED" } else { "" }
     ));
+    if let Some(sec) = &s.second {
+        log.raw(&format!("2nd copy   {}: {} failed", sec.display(), s.second_failed));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,20 +258,65 @@ fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> Receiver<Chunk>
     rx
 }
 
-fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<Summary> {
+/// Checks before anything is written: the second-copy folder is there and
+/// doesn't overlap the library or the source, and each disk has room.
+fn preflight(plan: &Plan, second: Option<&Path>, need_lib: u64, need_second: u64) -> Result<()> {
+    let mut need: Vec<(u64, &Path, u64)> = vec![(fs::metadata(&plan.root)?.dev(), &plan.root, need_lib)];
+    if let Some(sec) = second {
+        if !sec.is_dir() {
+            bail!("Second copy folder not found: {} (is the drive connected?)", tilde(sec));
+        }
+        let sc = fs::canonicalize(sec)?;
+        for (other, what) in [(&plan.root, "library"), (&plan.source, "source")] {
+            let o = fs::canonicalize(other)?;
+            if sc.starts_with(&o) || o.starts_with(&sc) {
+                bail!("The second copy folder {} overlaps the {what} ({})", tilde(sec), tilde(other));
+            }
+        }
+        let dev = fs::metadata(sec)?.dev();
+        match need.iter_mut().find(|(d, _, _)| *d == dev) {
+            Some(n) => n.2 += need_second,
+            None => need.push((dev, sec, need_second)),
+        }
+    }
+    for (_, p, bytes) in need {
+        if let Some(free) = free_bytes(p) {
+            if bytes > free {
+                bail!("Not enough space on the disk holding {}: need {}, {} free", tilde(p), human_bytes(bytes), human_bytes(free));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Space available to this user on the disk holding `p`.
+fn free_bytes(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: c is a valid NUL-terminated path and st a valid out-pointer.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0).then_some(st.f_bavail as u64 * st.f_bsize as u64)
+}
+
+fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<Summary> {
+    let dest_dev = fs::metadata(&plan.root)?.dev();
+    let new: Vec<&Item> = plan.new_items().collect();
+    // A move within the library's disk is a rename. Not with a second copy:
+    // that needs the bytes, so every file is read.
+    let renames: Vec<bool> = new
+        .iter()
+        .map(|i| second.is_none() && mode == Mode::Move && fs::metadata(&i.src).map(|m| m.dev() == dest_dev).unwrap_or(false))
+        .collect();
+    let need_lib = new.iter().zip(&renames).filter(|(_, r)| !**r).map(|(i, _)| i.size).sum();
+    preflight(plan, second, need_lib, plan.new_bytes())?;
+
     let cat = Catalog::open(&plan.root)?;
     let vol = plan.volume.as_ref().map(|(n, u)| (n.as_str(), u.as_str()));
     let import_id = cat.begin_import("import", &plan.source.to_string_lossy(), vol, mode.key(), &plan.layout)?;
     let (mut log, log_path, stamp) = open_log(plan, "import")?;
-    header(&mut log, plan, mode.label());
+    header(&mut log, plan, mode.label(), second);
     let csv_path = write_dup_csv(plan, &stamp, &[])?;
 
-    let dest_dev = fs::metadata(&plan.root)?.dev();
-    let new: Vec<&Item> = plan.new_items().collect();
-    let renames: Vec<bool> = new
-        .iter()
-        .map(|i| mode == Mode::Move && fs::metadata(&i.src).map(|m| m.dev() == dest_dev).unwrap_or(false))
-        .collect();
     let cancel_arc = Arc::new(AtomicBool::new(false));
     let to_read: Vec<PathBuf> = new.iter().zip(&renames).filter(|(_, r)| !**r).map(|(i, _)| i.src.clone()).collect();
     let rx = spawn_reader(to_read, cancel_arc.clone());
@@ -281,16 +336,31 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
         log_path,
         csv_path,
         note: None,
+        second: second.map(Path::to_path_buf),
+        second_failed: 0,
     };
 
     let (ftx, frx) = sync_channel::<Written>(FINISH_QUEUE);
     let (cat, mut log, s) = thread::scope(|sc| {
-        let fin = Finisher { new: &new, mode, cat, log, s, import_id, tx, open_tx: false, rows: 0, pending: Vec::new(), last: None };
+        let fin = Finisher {
+            new: &new,
+            mode,
+            cat,
+            log,
+            s,
+            import_id,
+            tx,
+            open_tx: false,
+            rows: 0,
+            pending: Vec::new(),
+            last: None,
+            last2: None,
+        };
         let handle = sc.spawn(move || fin.run(frx));
 
-        // Writer: stream each file to its temp path and hand it on. Flushing,
-        // verifying and cataloguing happen on the finisher, so this loop keeps
-        // draining the reader queue.
+        // Writer: stream each file to its temp path(s) and hand it on.
+        // Flushing, verifying and cataloguing happen on the finisher, so this
+        // loop keeps draining the reader queue.
         let mut bytes_done = 0u64;
         for (k, item) in new.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
@@ -303,7 +373,7 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
                 let _ = tx.send(XferMsg::Progress { files_done: k, bytes_done: base + n, current: item.name.clone(), phase });
             };
             send(0, if renames[k] { "moving" } else { "copying" });
-            let w = if renames[k] { Written::Done { k, result: rename_in(item), copied: false } } else { copy_in(k, item, &rx, &send) };
+            let w = if renames[k] { Written::Done { k, result: rename_in(item), copied: false } } else { copy_in(k, item, second, &rx, &send) };
             bytes_done = base + item.size;
             if ftx.send(w).is_err() {
                 break;
@@ -319,8 +389,8 @@ fn import(plan: &Plan, mode: Mode, cancel: &AtomicBool, tx: &Sender<XferMsg>) ->
     cat.finish_import(
         import_id,
         &format!(
-            "{{\"transferred\":{},\"failed\":{},\"duplicates\":{},\"conflicts\":{},\"cancelled\":{}}}",
-            s.transferred, s.failed, s.duplicates, s.conflicts, s.cancelled
+            "{{\"transferred\":{},\"failed\":{},\"duplicates\":{},\"conflicts\":{},\"second_copy_failed\":{},\"cancelled\":{}}}",
+            s.transferred, s.failed, s.duplicates, s.conflicts, s.second_failed, s.cancelled
         ),
     )?;
     Ok(s)
@@ -330,11 +400,21 @@ type Hashes = (Option<[u8; 32]>, Option<[u8; 32]>);
 
 /// Files handed from the writer to the finisher, in plan order.
 enum Written {
-    /// Fully streamed to `tmp`; still to be flushed, verified and renamed.
-    Copied { k: usize, tmp: PathBuf, file: File, hash: [u8; 32], head: [u8; 32] },
+    /// Fully streamed to `tmp` (and to the second copy, if any); still to be
+    /// flushed, verified and renamed.
+    Copied { k: usize, tmp: PathBuf, file: File, hash: [u8; 32], head: [u8; 32], second: Option<Second> },
     /// Already settled: a same-disk rename, or a copy that failed.
     Done { k: usize, result: Result<Hashes, String>, copied: bool },
     Cancelled { remaining: usize },
+}
+
+/// A file's copy in the second-copy folder.
+enum Second {
+    /// Streamed to `tmp`; flushed, verified and renamed like the main copy.
+    Tmp { tmp: PathBuf, file: File, dest: PathBuf },
+    /// Something is already at that path: fine if it has the same content.
+    Existing(PathBuf),
+    Failed(String),
 }
 
 /// Copied files waiting in the finisher queue (each holds an open file, no data).
@@ -362,25 +442,43 @@ struct Finisher<'a> {
     open_tx: bool,
     rows: usize,
     pending: Vec<Pending>,
-    /// Most recent copy, kept open so one F_FULLFSYNC on it flushes the
-    /// drive cache for everything fsync'd before it.
+    /// Most recent copy on each disk (library, second copy), kept open so
+    /// one F_FULLFSYNC on it flushes that drive's cache for everything
+    /// fsync'd before it.
     last: Option<File>,
+    last2: Option<File>,
 }
 
 impl Finisher<'_> {
     fn run(mut self, rx: Receiver<Written>) -> (Catalog, Log, Summary) {
         for w in rx {
             match w {
-                Written::Copied { k, tmp, file, hash, head } => {
-                    let r = finish_copy(self.new[k], &tmp, &file, hash, head);
+                Written::Copied { k, tmp, file, hash, head, second } => {
+                    let item = self.new[k];
+                    // The two disks verify at the same time.
+                    let (r, r2) = thread::scope(|sc| {
+                        let h = second.map(|sec| sc.spawn(move || finish_second(item, sec, hash)));
+                        let r = finish_copy(item, &tmp, &file, hash, head);
+                        (r, h.map(|h| h.join().unwrap_or_else(|_| Err("thread panicked".into()))))
+                    });
                     if r.is_err() {
                         let _ = fs::remove_file(&tmp);
                     } else {
                         self.last = Some(file);
                     }
-                    self.record(k, r, true);
+                    let r2 = match r2 {
+                        Some(Ok(f)) => {
+                            if f.is_some() {
+                                self.last2 = f;
+                            }
+                            Some(Ok(()))
+                        }
+                        Some(Err(e)) => Some(Err(e)),
+                        None => None,
+                    };
+                    self.record(k, r, true, r2);
                 }
-                Written::Done { k, result, copied } => self.record(k, result, copied),
+                Written::Done { k, result, copied } => self.record(k, result, copied, None),
                 Written::Cancelled { remaining } => {
                     self.flush(false);
                     self.s.cancelled = true;
@@ -392,8 +490,9 @@ impl Finisher<'_> {
         (self.cat, self.log, self.s)
     }
 
-    fn record(&mut self, k: usize, r: Result<Hashes, String>, copied: bool) {
+    fn record(&mut self, k: usize, r: Result<Hashes, String>, copied: bool, second: Option<Result<(), String>>) {
         let item = self.new[k];
+        let second_err = second.and_then(Result::err);
         let outcome = r.map(|(head, full)| {
             if !self.open_tx {
                 self.open_tx = self.cat.conn.execute_batch("BEGIN").is_ok();
@@ -413,9 +512,16 @@ impl Finisher<'_> {
             self.rows += 1;
             self.s.transferred += 1;
             self.s.bytes += item.size;
-            rec.err().map(|e| format!("catalog: {e}"))
+            let mut warn: Vec<String> = rec.err().map(|e| format!("catalog: {e}")).into_iter().collect();
+            if let Some(e) = &second_err {
+                self.s.second_failed += 1;
+                warn.push(format!("second copy failed: {e}{}", if self.mode == Mode::Move { "; source kept" } else { "" }));
+            }
+            (!warn.is_empty()).then(|| warn.join("; "))
         });
-        self.pending.push(Pending { k, delete_source: self.mode == Mode::Move && copied && outcome.is_ok(), outcome });
+        // A source goes only once every copy of it is verified.
+        let delete_source = self.mode == Mode::Move && copied && outcome.is_ok() && second_err.is_none();
+        self.pending.push(Pending { k, delete_source, outcome });
         if self.mode == Mode::Copy {
             self.emit(true);
         }
@@ -429,9 +535,9 @@ impl Finisher<'_> {
     fn flush(&mut self, end: bool) {
         let mut durable = true;
         if end || self.pending.iter().any(|p| p.delete_source) {
-            if let Some(f) = self.last.take() {
-                // std's sync_all is F_FULLFSYNC on macOS: flushes the drive cache.
-                durable = f.sync_all().is_ok();
+            // std's sync_all is F_FULLFSYNC on macOS: flushes the drive cache.
+            for f in [self.last.take(), self.last2.take()].into_iter().flatten() {
+                durable &= f.sync_all().is_ok();
             }
         }
         if self.open_tx {
@@ -487,8 +593,9 @@ fn rename_in(item: &Item) -> Result<Hashes, String> {
 }
 
 /// Consume exactly one file's chunks from the reader, even on error, so the
-/// stream stays aligned with the item list.
-fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) -> Written {
+/// stream stays aligned with the item list. Each chunk is written to the
+/// library and, if set, the second copy: the card is read once.
+fn copy_in(k: usize, item: &Item, second_root: Option<&Path>, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) -> Written {
     let Some(dir) = item.dest.parent() else {
         // Still drain this file's chunks.
         while let Ok(Chunk::Data(_)) = rx.recv() {}
@@ -513,6 +620,7 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
             }
         },
     };
+    let mut second = if err.is_none() { second_root.map(|r| open_second(r, item)) } else { None };
 
     let mut h = blake3::Hasher::new();
     let mut quick = HeadHasher::new();
@@ -527,6 +635,13 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
                         if let Err(e) = f.write_all(&buf) {
                             err = Some(format!("write: {e}"));
                         }
+                    }
+                    let failed = match &mut second {
+                        Some(Second::Tmp { file, .. }) => file.write_all(&buf).err(),
+                        _ => None,
+                    };
+                    if let Some(e) = failed {
+                        drop_second(&mut second, format!("write: {e}"));
                     }
                 }
                 n += buf.len() as u64;
@@ -546,19 +661,45 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
     }
 
     match (err, w) {
-        (None, Some(file)) => Written::Copied { k, tmp, file, hash: *h.finalize().as_bytes(), head: quick.finalize() },
+        (None, Some(file)) => Written::Copied { k, tmp, file, hash: *h.finalize().as_bytes(), head: quick.finalize(), second },
         (err, _) => {
             let _ = fs::remove_file(&tmp);
+            drop_second(&mut second, String::new());
             Written::Done { k, result: Err(err.unwrap_or_else(|| "no file".into())), copied: true }
         }
     }
 }
 
-/// Runs on the finisher thread: copy times, fsync, verify, rename into place.
-/// Both hashes were taken from the stream; the full re-read confirms the
-/// copy holds those same bytes, so the quick hash holds for it too.
-fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32], head: [u8; 32]) -> Result<Hashes, String> {
-    if let Ok(meta) = fs::metadata(&item.src) {
+/// Where this file goes in the second copy: the same path as in the library.
+fn open_second(root: &Path, item: &Item) -> Second {
+    let dest = root.join(&item.rel_dest);
+    let Some(dir) = dest.parent() else { return Second::Failed("bad destination".into()) };
+    if let Err(e) = fs::create_dir_all(dir) {
+        return Second::Failed(format!("mkdir: {e}"));
+    }
+    if dest.exists() {
+        return Second::Existing(dest);
+    }
+    let tmp = dir.join(format!(".{}.mootui-partial", item.name));
+    match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        Ok(file) => Second::Tmp { tmp, file, dest },
+        Err(e) => Second::Failed(format!("create: {e}")),
+    }
+}
+
+/// Give up on the second copy of this file, removing its partial copy.
+fn drop_second(second: &mut Option<Second>, why: String) {
+    if let Some(Second::Tmp { tmp, .. }) = second {
+        let _ = fs::remove_file(tmp);
+    }
+    if second.is_some() {
+        *second = Some(Second::Failed(why));
+    }
+}
+
+/// Copy the source's modified, accessed (and on macOS created) times.
+fn copy_times(src: &Path, f: &File) {
+    if let Ok(meta) = fs::metadata(src) {
         let mut times = fs::FileTimes::new();
         if let Ok(t) = meta.modified() {
             times = times.set_modified(t);
@@ -573,8 +714,14 @@ fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32], head: [u8;
         }
         let _ = f.set_times(times);
     }
-    fsync(f).map_err(|e| format!("sync: {e}"))?;
+}
 
+/// Runs on the finisher thread: copy times, fsync, verify, rename into place.
+/// Both hashes were taken from the stream; the full re-read confirms the
+/// copy holds those same bytes, so the quick hash holds for it too.
+fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32], head: [u8; 32]) -> Result<Hashes, String> {
+    copy_times(&item.src, f);
+    fsync(f).map_err(|e| format!("sync: {e}"))?;
     let written = hash_file(tmp).map_err(|e| format!("verify: {e}"))?;
     if streamed != written || item.full.is_some_and(|f| f != streamed) {
         return Err("verification failed: copy does not match source".into());
@@ -584,6 +731,39 @@ fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32], head: [u8;
     }
     fs::rename(tmp, &item.dest).map_err(|e| format!("rename: {e}"))?;
     Ok((Some(head), Some(streamed)))
+}
+
+/// The same for the second copy, alongside finish_copy. Returns the file
+/// when a new copy was written, for the batch's drive flush.
+fn finish_second(item: &Item, second: Second, streamed: [u8; 32]) -> Result<Option<File>, String> {
+    match second {
+        Second::Failed(e) => Err(e),
+        Second::Existing(dest) => match hash_file(&dest) {
+            Ok(h) if h == streamed => Ok(None),
+            Ok(_) => Err(format!("a different file is already at {}", dest.display())),
+            Err(e) => Err(format!("reading {}: {e}", dest.display())),
+        },
+        Second::Tmp { tmp, file, dest } => {
+            let r = (|| {
+                copy_times(&item.src, &file);
+                fsync(&file).map_err(|e| format!("sync: {e}"))?;
+                if hash_file(&tmp).map_err(|e| format!("verify: {e}"))? != streamed {
+                    return Err("verification failed: copy does not match source".to_string());
+                }
+                if dest.exists() {
+                    return Err("exists at destination".into());
+                }
+                fs::rename(&tmp, &dest).map_err(|e| format!("rename: {e}"))
+            })();
+            match r {
+                Ok(()) => Ok(Some(file)),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 /// Plain fsync(2): hands the data to the drive. Unlike std's sync_all on
@@ -648,7 +828,7 @@ fn reconcile(plan: &Plan, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<S
     let cat = Catalog::open(root)?;
     let id = cat.begin_import(plan.kind.key(), &root.to_string_lossy(), None, "move", &plan.layout)?;
     let (mut log, log_path, stamp) = open_log(plan, plan.kind.key())?;
-    header(&mut log, plan, "MOVE (within library)");
+    header(&mut log, plan, "MOVE (within library)", None);
 
     let mut s = Summary {
         kind: plan.kind,
@@ -665,6 +845,8 @@ fn reconcile(plan: &Plan, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<S
         log_path,
         csv_path: None,
         note: None,
+        second: None,
+        second_failed: 0,
     };
 
     let moves: Vec<&Item> = plan.new_items().collect();

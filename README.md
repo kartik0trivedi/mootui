@@ -78,6 +78,7 @@ mootui                                   # interactive: pick a card, folder or T
 mootui ~/Desktop/dump                    # open a folder straight away
 mootui --plan /Volumes/SD/DCIM           # dry run: show what would happen
 mootui --yes [--move] [--verify] SOURCE  # import without the UI (copies by default)
+mootui --yes --second-copy DIR SOURCE    # ...and write a verified second copy to DIR
 mootui --tidy [--yes] [--trash]          # sort loose files already in the library
 mootui --reorganize [--yes]              # re-sort the whole library to the layout
 mootui --undo                            # undo the last tidy/reorganize
@@ -137,13 +138,23 @@ mootui always skips `.mootui`, hidden folders, macOS packages (`*.photoslibrary`
 
 | Path                               | Contents                                                                |
 | ---------------------------------- | ----------------------------------------------------------------------- |
-| `~/.config/mootui/config.toml`   | per-machine settings: default library, copy/move, extra backup folder   |
+| `~/.config/mootui/config.toml`   | per-machine settings: default library, copy/move, extra backup folder, second copy folder |
 | `<library>/.mootui/library.toml` | settings that travel with the library: layout, duplicate rule, excludes |
 | `<library>/.mootui/catalog.db`   | SQLite index plus import and move history                               |
 | `<library>/.mootui/backups/`     | the last 5 catalog snapshots, taken after every run                     |
 | `<library>/LOG/`                 | transfer, tidy and undo logs, plus a CSV of duplicates for each run     |
 
 The catalog is refreshed with a quick metadata scan before every import or tidy. To rebuild it, delete `.mootui/catalog.db`. Import history and original filenames can't be rebuilt, which is why mootui keeps backups. You can set an extra backup folder (for example in Google Drive or Dropbox) in Settings. Finished backups are safe to sync; the live catalog is not, so mootui refuses to use a library inside a cloud-synced folder.
+
+### Second copy
+
+The extra backup folder holds catalog backups only. To keep a second copy of the photos themselves, set **Second copy** in Settings (or pass `--second-copy DIR`; `--no-second-copy` skips it for one run). Every import then also writes each new file to that folder, using the same paths as in the library:
+
+- The card is still read only once. Each chunk goes to both disks, and each copy is verified separately.
+- The import won't start if the folder is missing (for example, the drive isn't connected), overlaps the library or the source, or either disk lacks space for the import.
+- If a second copy fails, the file stays imported and the failure is reported as a warning. In move mode, a source file is deleted only after both copies are verified and flushed to disk.
+- A file already in the second copy with identical content counts as copied. One with different content is left alone and reported.
+- The second copy has no catalog of its own. Tidy and Reorganize change only the library, so afterwards the second copy keeps the old layout.
 
 ## Performance
 
@@ -205,15 +216,16 @@ An import is a three-stage pipeline, so the card is read without pauses:
 
 Other details:
 
-- **Batched disk flushes.** Each copy gets an `fsync`, but the slow full flush of the drive's cache (`F_FULLFSYNC`) runs once per 64 files in move mode (before any of those originals are deleted) and once at the end of the run, not after every file.
+- **Batched disk flushes.** Each copy gets an `fsync`, but the slow full flush of the drive's cache (`F_FULLFSYNC`) runs once per 64 files in move mode (before any of those originals are deleted) and once at the end of the run, not after every file. With a second copy, both drives are flushed this way, and the two copies are verified in parallel.
 - **Batched catalog writes.** The catalog is written in transactions of 64 files.
 - **Fast date reads.** Capture dates are read only for one file per base-name group, and only for files not already known to be duplicates. A built-in EXIF reader handles JPEG, TIFF-based raws and Fujifilm RAF from each file's first 64 KB. Anything it can't date (HEIC, CR3, video, dates only in XMP) goes to a single `exiftool -stay_open -fast2` process, started only when needed. On a 1,464-file folder, planning went from 7–11 s to 0.1 s.
+- **Parallel library scan.** The quick scan that keeps the catalog up to date reads the library's folders and file metadata in parallel (100,000 files: ~115 ms instead of ~300 ms on an SSD). The card is still listed in order.
 - **No async runtime.** mootui uses plain threads and channels, because the job is bulk I/O limited by disk throughput.
 
 ## FAQ
 
 **Does mootui modify or delete files on my SD card?**
-Not by default; it copies. In move mode (`m` or `--move`) it deletes a source file only after the copy has been verified and flushed to disk.
+Not by default; it copies. In move mode (`m` or `--move`) it deletes a source file only after the copy (and the second copy, if set) has been verified and flushed to disk.
 
 **Can I use it alongside Lightroom, Capture One or Apple Photos?**
 Yes. mootui writes ordinary folders. Point your editor at the library, or import from it. Tidy leaves already-sorted folders untouched.

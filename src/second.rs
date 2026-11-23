@@ -84,12 +84,13 @@ pub fn catch_up(root: &Path, second: &Path, rels: &[String], cancel: &dyn Fn() -
     }
 
     let mut last: Option<File> = None;
+    let mut buf = if todo.is_empty() { Vec::new() } else { vec![0u8; 8 << 20] };
     for (rel, size) in todo {
         if cancel() {
             r.cancelled = true;
             break;
         }
-        match copy_one(&root.join(rel), &second.join(rel)) {
+        match copy_one(&root.join(rel), &second.join(rel), &mut buf) {
             Ok(f) => {
                 last = Some(f);
                 r.copied += 1;
@@ -107,7 +108,7 @@ pub fn catch_up(root: &Path, second: &Path, rels: &[String], cancel: &dyn Fn() -
 }
 
 /// Copy, fsync, verify by re-reading, then rename into place.
-fn copy_one(src: &Path, dest: &Path) -> Result<File, String> {
+fn copy_one(src: &Path, dest: &Path, buf: &mut [u8]) -> Result<File, String> {
     let dir = dest.parent().ok_or("bad destination")?;
     fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
     let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -117,9 +118,8 @@ fn copy_one(src: &Path, dest: &Path) -> Result<File, String> {
         let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| format!("create: {e}"))?;
         let mut inp = File::open(src).map_err(|e| format!("open: {e}"))?;
         let mut h = blake3::Hasher::new();
-        let mut buf = vec![0u8; 8 << 20];
         loop {
-            let n = inp.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+            let n = inp.read(buf).map_err(|e| format!("read: {e}"))?;
             if n == 0 {
                 break;
             }

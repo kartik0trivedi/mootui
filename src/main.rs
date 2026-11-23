@@ -23,6 +23,8 @@ mod second;
 mod transfer;
 mod util;
 mod volumes;
+#[cfg(test)]
+mod tests;
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -65,6 +67,8 @@ struct Library {
     _lock: File,
     /// Runs that never finished, found when the library was opened.
     notice: Option<String>,
+    /// Cached count of present files, refreshed after jobs/transfers.
+    present_count: i64,
 }
 
 fn check_library_dir(root: &Path) -> Result<()> {
@@ -91,7 +95,8 @@ fn attach(root: &Path) -> Result<Library> {
     }
     let cfg = LibraryConfig::load(root);
     let notice = interrupted_notice(&cat.close_interrupted()?);
-    Ok(Library { root: root.to_path_buf(), cfg, cat, _lock: lock, notice })
+    let present_count = cat.count_present();
+    Ok(Library { root: root.to_path_buf(), cfg, cat, _lock: lock, notice, present_count })
 }
 
 /// What to tell the user about runs that never finished.
@@ -297,8 +302,11 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
         let from = i.src.strip_prefix(&plan.source).unwrap_or(&i.src).display().to_string();
         println!("  {tag}  {from:<40} -> {:<32} [{}]{extra}", i.rel_dest, i.date_src);
     }
+    for err in &plan.scan_errors {
+        eprintln!("  scan err   {err}");
+    }
     println!(
-        "plan: {} to {} ({}), {} duplicate, {} conflict, {} undated, {} ignored, {} already in place",
+        "plan: {} to {} ({}), {} duplicate, {} conflict, {} undated, {} ignored, {} already in place{}",
         plan.new_items().count(),
         if kind == Kind::Import { "import" } else { "move" },
         human_bytes(plan.new_bytes()),
@@ -306,7 +314,8 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
         plan.conflicts().count(),
         plan.undated.len(),
         plan.ignored,
-        plan.in_place
+        plan.in_place,
+        if plan.scan_errors.is_empty() { String::new() } else { format!(", {} scan error(s)", plan.scan_errors.len()) }
     );
     if args.plan_only || (kind != Kind::Import && !args.yes) {
         if kind != Kind::Import {
@@ -345,7 +354,8 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
 }
 
 fn index_message(s: &library::SyncStats) -> String {
-    format!("Catalog up to date: {} files ({} new or changed, {} missing)", s.total, s.added, s.missing)
+    let err = if s.errors.is_empty() { String::new() } else { format!(", {} scan error(s)", s.errors.len()) };
+    format!("Catalog up to date: {} files ({} new or changed, {} missing{err})", s.total, s.added, s.missing)
 }
 
 fn summary_line(s: &Summary) -> String {
@@ -354,7 +364,7 @@ fn summary_line(s: &Summary) -> String {
         _ => "moved",
     };
     format!(
-        "{} {verb} ({}), {} failed, {} warnings, {} duplicates{}, {} conflicts{}",
+        "{} {verb} ({}), {} failed, {} warnings, {} duplicates{}, {} conflicts{}{}",
         s.transferred,
         human_bytes(s.bytes),
         s.failed,
@@ -362,6 +372,7 @@ fn summary_line(s: &Summary) -> String {
         s.duplicates,
         if s.trashed > 0 { format!(" ({} to Trash)", s.trashed) } else { String::new() },
         s.conflicts,
+        if s.scan_errors > 0 { format!(", {} scan error(s)", s.scan_errors) } else { String::new() },
         if s.cancelled { " — CANCELLED" } else { "" }
     ) + &match &s.second {
         Some(sec) => format!(
@@ -419,6 +430,8 @@ struct App {
     pending_root: PathBuf,
 
     volumes: Vec<volumes::Volume>,
+    /// Cached last-import (started, count) per entry in `volumes`.
+    volume_last_imports: Vec<Option<(String, i64)>>,
     pick: ListState,
     last_refresh: Instant,
     input: String,
@@ -468,6 +481,7 @@ impl App {
             lib: None,
             pending_root: root.clone(),
             volumes: Vec::new(),
+            volume_last_imports: Vec::new(),
             pick: ListState::default().with_selected(Some(0)),
             last_refresh: Instant::now(),
             input: String::new(),
@@ -553,7 +567,7 @@ impl App {
                 if let Some(n) = notice {
                     self.message = Some((n, true));
                 }
-                self.refresh_undo();
+                self.refresh_catalog_cache();
                 self.screen = Screen::Pick;
             }
             Err(e) => {
@@ -579,12 +593,28 @@ impl App {
         }
     }
 
-    fn refresh_undo(&mut self) {
+    fn refresh_catalog_cache(&mut self) {
+        if let Some(l) = self.lib.as_mut() {
+            l.present_count = l.cat.count_present();
+        }
         self.undo_label = self
             .lib
             .as_ref()
             .and_then(|l| l.cat.last_undoable().ok().flatten())
             .map(|(_, kind, started)| format!("Undo last {kind} ({started})"));
+        self.refresh_volume_history();
+    }
+
+    fn refresh_volume_history(&mut self) {
+        self.volume_last_imports = self
+            .volumes
+            .iter()
+            .map(|v| {
+                v.uuid
+                    .as_deref()
+                    .and_then(|u| self.lib.as_ref().and_then(|l| l.cat.last_import_from(u).ok().flatten()))
+            })
+            .collect();
     }
 
     fn save_lib_cfg(&mut self) {
@@ -728,7 +758,7 @@ impl App {
             }
             if finished {
                 self.job_rx = None;
-                self.refresh_undo();
+                self.refresh_catalog_cache();
             }
         }
 
@@ -766,7 +796,7 @@ impl App {
             }
             if finished {
                 self.xfer_rx = None;
-                self.refresh_undo();
+                self.refresh_catalog_cache();
             }
         }
 
@@ -777,6 +807,7 @@ impl App {
 
     fn refresh_volumes(&mut self) {
         self.volumes = volumes::list();
+        self.refresh_volume_history();
         self.last_refresh = Instant::now();
         let n = self.entries().len();
         if self.pick.selected().is_none_or(|i| i >= n) {
@@ -1098,7 +1129,7 @@ impl App {
                 tilde(&l.root),
                 format!(
                     "  ·  {} files  ·  layout: {}  ·  duplicates: {}  ·  {}",
-                    l.cat.count_present(),
+                    l.present_count,
                     layout::preset_name(&l.cfg.layout),
                     self.dup_mode.label(),
                     self.mode.label()
@@ -1220,10 +1251,7 @@ impl App {
                     if v.has_dcim {
                         spans.push(Span::styled("  camera card", Style::new().fg(Color::Green)));
                     }
-                    let last = v
-                        .uuid
-                        .as_deref()
-                        .and_then(|u| self.lib.as_ref().and_then(|l| l.cat.last_import_from(u).ok().flatten()));
+                    let last = self.volume_last_imports.get(i).and_then(|x| x.as_ref());
                     if let Some((when, n)) = last {
                         spans.push(Span::styled(
                             format!("  · last imported {} ({n} files)", &when[..when.len().min(16)]),
@@ -1362,18 +1390,22 @@ impl App {
         let n_new = plan.new_items().count();
         let n_dup = plan.duplicates().count();
         let n_con = plan.conflicts().count();
-        let mut lines = vec![Line::from(vec![
+        let mut stat_spans = vec![
             Span::styled(format!(" {n_new} {} ", if import { "new" } else { "to move" }), Style::new().fg(Color::Green).bold()),
             Span::raw(format!("({})   ", human_bytes(plan.new_bytes()))),
             Span::styled(format!("{n_dup} duplicates"), Style::new().fg(Color::Yellow).bold()),
             Span::raw("   "),
             Span::styled(format!("{n_con} conflicts"), Style::new().fg(Color::Red).bold()),
             Span::raw(format!("   {} undated", plan.undated.len())),
-            Span::styled(
-                if import { format!("   {} non-media ignored", plan.ignored) } else { format!("   {} already in place", plan.in_place) },
-                Style::new().dark_gray(),
-            ),
-        ])];
+        ];
+        if !plan.scan_errors.is_empty() {
+            stat_spans.push(Span::styled(format!("   {} scan error(s)", plan.scan_errors.len()), Style::new().fg(Color::Red).bold()));
+        }
+        stat_spans.push(Span::styled(
+            if import { format!("   {} non-media ignored", plan.ignored) } else { format!("   {} already in place", plan.in_place) },
+            Style::new().dark_gray(),
+        ));
+        let mut lines = vec![Line::from(stat_spans)];
         if import {
             let ms = if self.mode == Mode::Move {
                 Style::new().fg(Color::Black).bg(Color::Yellow).bold()
@@ -1556,6 +1588,9 @@ impl App {
             }
             if s.warnings > 0 {
                 lines.push(Line::from(Span::styled(format!("  {} warning(s) — see log", s.warnings), Style::new().fg(Color::Yellow))));
+            }
+            if s.scan_errors > 0 {
+                lines.push(Line::from(Span::styled(format!("  {} scan error(s) — see log", s.scan_errors), Style::new().fg(Color::Red))));
             }
             if s.second_caught_up > 0 {
                 lines.push(Line::from(format!("  {} file(s) already in the library added to the second copy", s.second_caught_up)));

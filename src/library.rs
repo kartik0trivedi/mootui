@@ -53,6 +53,12 @@ pub fn is_excluded_dir(name: &str, cfg: &LibraryConfig) -> bool {
     })
 }
 
+pub struct WalkResult {
+    pub files: Vec<DiskFile>,
+    pub partials: Vec<PathBuf>,
+    pub errors: Vec<String>,
+}
+
 /// Every media file in the library, sorted by path. Folders are read in
 /// parallel and so are the stats within a folder: each readdir and stat
 /// mostly waits on the disk, so keeping many in flight finishes sooner,
@@ -60,21 +66,41 @@ pub fn is_excluded_dir(name: &str, cfg: &LibraryConfig) -> bool {
 /// order, in plan.rs: it reads fastest sequentially.)
 ///
 /// Also returns any partial copies (hidden `.*.mootui-partial` files) left
-/// by a run that crashed.
-pub fn walk(root: &Path, cfg: &LibraryConfig) -> (Vec<DiskFile>, Vec<PathBuf>) {
-    let (mut out, partials) = walk_dir(root, root, cfg);
-    out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
-    (out, partials)
+/// by a run that crashed, and any read/stat errors encountered.
+pub fn walk(root: &Path, cfg: &LibraryConfig) -> WalkResult {
+    let mut res = walk_dir(root, root, cfg);
+    res.files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
+    res.errors.sort();
+    res
 }
 
 /// Symlinks are not followed, hidden files and excluded folders are skipped.
-fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> (Vec<DiskFile>, Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
+fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> WalkResult {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            return WalkResult { files: Vec::new(), partials: Vec::new(), errors: vec![format!("{}: {e}", dir.display())] };
+        }
+    };
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
     let mut partials = Vec::new();
-    for e in rd.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
+    let mut errors = Vec::new();
+    for entry in rd {
+        let e = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                errors.push(format!("{}: {err}", dir.display()));
+                continue;
+            }
+        };
+        let ft = match e.file_type() {
+            Ok(ft) => ft,
+            Err(err) => {
+                errors.push(format!("{}: {err}", e.path().display()));
+                continue;
+            }
+        };
         let name = e.file_name();
         let name = name.to_string_lossy();
         if ft.is_dir() {
@@ -87,29 +113,44 @@ fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> (Vec<DiskFile>, Vec
             partials.push(e.path());
         }
     }
-    let mut out: Vec<DiskFile> = files
+    let stats: Vec<Result<DiskFile, String>> = files
         .into_par_iter()
-        .filter_map(|abs| {
-            let m = fs::symlink_metadata(&abs).ok()?;
-            let rel = abs.strip_prefix(root).ok()?.to_string_lossy().into_owned();
-            Some(DiskFile { rel, size: m.len(), mtime: mtime_of(&m), abs })
+        .map(|abs| {
+            let m = fs::symlink_metadata(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
+            let rel = abs
+                .strip_prefix(root)
+                .map_err(|e| format!("{}: {e}", abs.display()))?
+                .to_string_lossy()
+                .into_owned();
+            Ok(DiskFile { rel, size: m.len(), mtime: mtime_of(&m), abs })
         })
         .collect();
-    let (sub, sub_partials): (Vec<Vec<DiskFile>>, Vec<Vec<PathBuf>>) = subdirs.par_iter().map(|d| walk_dir(root, d, cfg)).unzip();
-    out.extend(sub.into_iter().flatten());
-    partials.extend(sub_partials.into_iter().flatten());
-    (out, partials)
+    let mut out = Vec::with_capacity(stats.len());
+    for s in stats {
+        match s {
+            Ok(f) => out.push(f),
+            Err(e) => errors.push(e),
+        }
+    }
+    let subs: Vec<WalkResult> = subdirs.par_iter().map(|d| walk_dir(root, d, cfg)).collect();
+    for sub in subs {
+        out.extend(sub.files);
+        partials.extend(sub.partials);
+        errors.extend(sub.errors);
+    }
+    WalkResult { files: out, partials, errors }
 }
 
 pub struct SyncStats {
     pub added: usize,
     pub missing: usize,
     pub total: usize,
+    pub errors: Vec<String>,
 }
 
 pub fn sync(cat: &Catalog, cfg: &LibraryConfig, exif: &mut exif::Reader, p: &Progress) -> Result<SyncStats> {
     p.phase("Checking library for changes", 0);
-    let (disk, partials) = walk(&cat.root, cfg);
+    let WalkResult { files: disk, partials, errors } = walk(&cat.root, cfg);
     // Every caller holds the library lock, so no run is writing these: they
     // were left by one that crashed.
     for f in partials {
@@ -171,7 +212,7 @@ pub fn sync(cat: &Catalog, cfg: &LibraryConfig, exif: &mut exif::Reader, p: &Pro
         tx.commit()?;
     }
 
-    Ok(SyncStats { added: changed.len(), missing, total: disk.len() })
+    Ok(SyncStats { added: changed.len(), missing, total: disk.len(), errors })
 }
 
 /// Fill in missing hashes for library rows, in parallel (the library is on a
@@ -270,7 +311,8 @@ mod tests {
 
         fs::write(root.join("loose/.b.jpg.mootui-partial"), b"half").unwrap();
         let cfg = LibraryConfig::default();
-        let ((new, partials), old) = (walk(&root, &cfg), walk_serial(&root, &cfg));
+        let (WalkResult { files: new, partials, errors }, old) = (walk(&root, &cfg), walk_serial(&root, &cfg));
+        assert!(errors.is_empty());
         assert_eq!(partials, [root.join("loose/.b.jpg.mootui-partial")]);
         fs::remove_dir_all(&root).unwrap();
         let rels: Vec<&str> = new.iter().map(|f| f.rel.as_str()).collect();
@@ -290,7 +332,7 @@ mod tests {
             let old = walk_serial(&root, &cfg);
             let t_old = t.elapsed();
             let t = std::time::Instant::now();
-            let new = walk(&root, &cfg).0;
+            let new = walk(&root, &cfg).files;
             let t_new = t.elapsed();
             println!("{} files: serial {t_old:.2?}, parallel {t_new:.2?}", new.len());
             assert!(same(&new, &old));

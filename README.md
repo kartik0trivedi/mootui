@@ -107,7 +107,7 @@ mootui --library DIR ...                 # use a different library for this run
 
 ## How duplicate detection works
 
-- **Suspected** (default, same rule as Lightroom): same original filename, size and capture time as a file already in the catalog. Instant; the card is barely read.
+- **Suspected** (default, same rule as Lightroom): same original filename, size and capture time as a file already in the catalog (if either capture date is missing, mootui verifies by content instead of guessing). Instant; the card is barely read.
 - **Content-verified**: identical content, even if the file was renamed. Checks run in stages, from size to a 128 KB quick hash to a full hash, and the full hash runs only when the quick hash matches. Library hashes are computed once and stored.
 
 Duplicates are never copied or deleted during an import. A **conflict** is a destination name already taken by a different file; it is skipped, never overwritten.
@@ -153,7 +153,7 @@ The extra backup folder holds catalog backups only. To keep a second copy of the
 
 - The card is still read only once. Each chunk goes to both disks, and each copy is verified separately.
 - The import won't start if the folder is missing (for example, the drive isn't connected), overlaps the library or the source, or either disk lacks space for the import.
-- If a second copy fails, the file stays imported and the failure is reported as a warning. In move mode, a source file is deleted only after both copies are verified and flushed to disk.
+- If a second copy fails, the file stays imported and the failure is reported as a warning. In move mode, a source file (and its RAW + JPEG + sidecar companions) is deleted only after every copy in the group is verified and flushed to disk.
 - A file already in the second copy with identical content counts as copied. One with different content is left alone and reported.
 - Files an import skips as already in the library are also checked against the second copy, and copied there from the library if they're missing. That covers a rerun after an interrupted import.
 - **Catch up second copy** (on the start screen, or `--catch-up-second-copy`) copies every library file missing from the second copy, reading from the library rather than a card. Use it after turning the second copy on for an existing library, or after second copies failed. Files already there count as present when their size matches; anything copied is verified.
@@ -228,7 +228,7 @@ Other details:
 ## FAQ
 
 **Does mootui modify or delete files on my SD card?**
-Not by default; it copies. In move mode (`m` or `--move`) it deletes a source file only after the copy (and the second copy, if set) has been verified and flushed to disk.
+Not by default; it copies. In move mode (`m` or `--move`) it deletes a source file only after its copy (and second copy, if set) — along with all companions in the same RAW + JPEG + sidecar group — has been verified and flushed to disk.
 
 **What if an import is interrupted (the Mac sleeps, the card is pulled, mootui is killed)?**
 Import from the same card again. Files that reached the library are recognised as duplicates and skipped, and the rest are copied. A file is renamed into place only after it is verified, so the library never holds a half-copied photo; partial copies left behind are cleaned up automatically. The next time you open the library, mootui tells you which import didn't finish. With a second copy set, the rerun also fills in anything the second copy is missing.

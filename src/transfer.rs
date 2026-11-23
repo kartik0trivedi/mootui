@@ -13,6 +13,7 @@
 //! Every run writes LOG/<stamp>_<kind>.log; LOG/<stamp>_duplicates.csv too
 //! when duplicates were found.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
@@ -71,6 +72,7 @@ pub struct Summary {
     pub trashed: usize,
     pub conflicts: usize,
     pub undated: usize,
+    pub scan_errors: usize,
     pub cancelled: bool,
     pub log_path: PathBuf,
     pub csv_path: Option<PathBuf>,
@@ -175,7 +177,7 @@ fn header(log: &mut Log, plan: &Plan, mode: &str, second: Option<&Path>) {
         log.raw(&format!("duplicates {}", plan.dup_mode.label()));
     }
     log.raw(&format!(
-        "plan       {} to {}, {} duplicate, {} conflict, {} undated, {} non-media ignored, {} already in place",
+        "plan       {} to {}, {} duplicate, {} conflict, {} undated, {} non-media ignored, {} already in place{}",
         plan.new_items().count(),
         if plan.kind == Kind::Import { "transfer" } else { "move" },
         plan.duplicates().count(),
@@ -183,8 +185,12 @@ fn header(log: &mut Log, plan: &Plan, mode: &str, second: Option<&Path>) {
         plan.undated.len(),
         plan.ignored,
         plan.in_place,
+        if plan.scan_errors.is_empty() { String::new() } else { format!(", {} scan error(s)", plan.scan_errors.len()) },
     ));
     log.raw("");
+    for err in &plan.scan_errors {
+        log.line("SCAN ERR", err);
+    }
     for d in plan.duplicates() {
         if let Status::Duplicate { existing, rule, .. } = &d.status {
             log.line("DUPLICATE", &format!("{}  ==  {}  ({rule})", d.src.display(), existing.display()));
@@ -224,14 +230,16 @@ fn footer(log: &mut Log, s: &Summary) {
 // ---------------------------------------------------------------------------
 
 enum Chunk {
-    Data(Vec<u8>),
+    Data(Vec<u8>, usize),
     End(std::io::Result<()>),
 }
 
 /// Reads files in order into a bounded queue. One reader: a card is fastest
-/// read sequentially.
-fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> Receiver<Chunk> {
+/// read sequentially. Reuses buffers returned on `pool` so large imports don't
+/// allocate and free an 8 MB buffer per file.
+fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> (Receiver<Chunk>, Sender<Vec<u8>>) {
     let (tx, rx) = sync_channel(QUEUE);
+    let (pool_tx, pool_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         for p in paths {
             if cancel.load(Ordering::Relaxed) {
@@ -240,13 +248,12 @@ fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> Receiver<Chunk>
             let r = (|| -> std::io::Result<()> {
                 let mut f = File::open(&p)?;
                 loop {
-                    let mut buf = vec![0u8; CHUNK];
+                    let mut buf = pool_rx.try_recv().unwrap_or_else(|_| vec![0u8; CHUNK]);
                     let n = read_full(&mut f, &mut buf)?;
                     if n == 0 {
                         return Ok(());
                     }
-                    buf.truncate(n);
-                    if tx.send(Chunk::Data(buf)).is_err() {
+                    if tx.send(Chunk::Data(buf, n)).is_err() {
                         return Ok(());
                     }
                     if n < CHUNK {
@@ -259,7 +266,7 @@ fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> Receiver<Chunk>
             }
         }
     });
-    rx
+    (rx, pool_tx)
 }
 
 /// Checks before anything is written: the second-copy folder is there and
@@ -315,7 +322,7 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
 
     let cancel_arc = Arc::new(AtomicBool::new(false));
     let to_read: Vec<PathBuf> = new.iter().zip(&renames).filter(|(_, r)| !**r).map(|(i, _)| i.src.clone()).collect();
-    let rx = spawn_reader(to_read, cancel_arc.clone());
+    let (rx, pool_tx) = spawn_reader(to_read, cancel_arc.clone());
 
     let s = Summary {
         kind: Kind::Import,
@@ -328,6 +335,7 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         trashed: 0,
         conflicts: plan.conflicts().count(),
         undated: plan.undated.len(),
+        scan_errors: plan.scan_errors.len(),
         cancelled: false,
         log_path,
         csv_path,
@@ -336,6 +344,11 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         second_failed: 0,
         second_caught_up: 0,
     };
+
+    let mut group_sizes: HashMap<usize, usize> = HashMap::new();
+    for item in &new {
+        *group_sizes.entry(item.group).or_default() += 1;
+    }
 
     let (ftx, frx) = sync_channel::<Written>(FINISH_QUEUE);
     let (cat, mut log, s) = thread::scope(|sc| {
@@ -350,6 +363,8 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
             open_tx: false,
             rows: 0,
             pending: Vec::new(),
+            group_sizes,
+            group_held: HashMap::new(),
             last: None,
             last2: None,
         };
@@ -370,13 +385,18 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
                 let _ = tx.send(XferMsg::Progress { files_done: k, bytes_done: base + n, current: item.name.clone(), phase });
             };
             send(0, if renames[k] { "moving" } else { "copying" });
-            let w = if renames[k] { Written::Done { k, result: rename_in(item), copied: false } } else { copy_in(k, item, second, &rx, &send) };
+            let w = if renames[k] {
+                Written::Done { k, result: rename_in(item), copied: false }
+            } else {
+                copy_in(k, item, second, &rx, &pool_tx, &send)
+            };
             bytes_done = base + item.size;
             if ftx.send(w).is_err() {
                 break;
             }
         }
         drop(ftx);
+        drop(pool_tx);
         drop(rx);
         handle.join().expect("finisher thread panicked")
     });
@@ -474,6 +494,7 @@ struct Pending {
     k: usize,
     outcome: Result<Option<String>, String>,
     delete_source: bool,
+    group_ok: bool,
 }
 
 struct Finisher<'a> {
@@ -487,6 +508,10 @@ struct Finisher<'a> {
     open_tx: bool,
     rows: usize,
     pending: Vec<Pending>,
+    /// Number of New items in each photo group; Move mode holds deletion of a
+    /// multi-file group until every member of that group is verified & durable.
+    group_sizes: HashMap<usize, usize>,
+    group_held: HashMap<usize, Vec<(Pending, bool)>>,
     /// Most recent copy on each disk (library, second copy), kept open so
     /// one F_FULLFSYNC on it flushes that drive's cache for everything
     /// fsync'd before it.
@@ -532,6 +557,13 @@ impl Finisher<'_> {
             }
         }
         self.flush(true);
+        // Any multi-file group still held was never completed (e.g. cancelled);
+        // keep all of its source files.
+        let mut leftover: Vec<(usize, Vec<(Pending, bool)>)> = self.group_held.drain().collect();
+        leftover.sort_by_key(|(g, _)| *g);
+        for (_, members) in leftover {
+            self.settle_group(members, false);
+        }
         (self.cat, self.log, self.s)
     }
 
@@ -564,9 +596,10 @@ impl Finisher<'_> {
             }
             (!warn.is_empty()).then(|| warn.join("; "))
         });
-        // A source goes only once every copy of it is verified.
-        let delete_source = self.mode == Mode::Move && copied && outcome.is_ok() && second_err.is_none();
-        self.pending.push(Pending { k, delete_source, outcome });
+        // A source goes only once every copy of it (and its photo group) is verified.
+        let group_ok = outcome.is_ok() && second_err.is_none();
+        let delete_source = self.mode == Mode::Move && copied && group_ok;
+        self.pending.push(Pending { k, delete_source, group_ok, outcome });
         if self.mode == Mode::Copy {
             self.emit(true);
         }
@@ -598,32 +631,72 @@ impl Finisher<'_> {
 
     fn emit(&mut self, durable: bool) {
         for p in std::mem::take(&mut self.pending) {
-            let item = self.new[p.k];
-            let (tag, text) = match p.outcome {
-                Ok(mut warn) => {
-                    if p.delete_source {
-                        if !durable {
-                            warn = Some("flush to disk failed; source kept".into());
-                        } else if let Err(e) = fs::remove_file(&item.src) {
-                            warn = Some(format!("could not delete source: {e}"));
-                        }
-                    }
-                    match warn {
-                        Some(w) => {
-                            self.s.warnings += 1;
-                            ("WARNING", format!("{}  ->  {}  ({w})", item.src.display(), item.rel_dest))
-                        }
-                        None => (if self.mode == Mode::Move { "MOVED" } else { "COPIED" }, format!("{}  ->  {}", item.src.display(), item.rel_dest)),
+            let g = self.new[p.k].group;
+            let gsize = self.group_sizes.get(&g).copied().unwrap_or(1);
+            if self.mode == Mode::Move && gsize > 1 {
+                let entry = self.group_held.entry(g).or_default();
+                entry.push((p, durable));
+                if entry.len() == gsize {
+                    if let Some(members) = self.group_held.remove(&g) {
+                        self.settle_group(members, true);
                     }
                 }
-                Err(e) => {
-                    self.s.failed += 1;
-                    ("FAILED", format!("{}  ->  {}  ({e})", item.src.display(), item.rel_dest))
-                }
-            };
-            self.log.line(tag, &text);
-            let _ = self.tx.send(XferMsg::Line(format!("{tag:<9} {text}")));
+            } else {
+                self.emit_one(p, durable, None);
+            }
         }
+    }
+
+    fn settle_group(&mut self, members: Vec<(Pending, bool)>, complete: bool) {
+        let all_ok = complete && members.iter().all(|(p, d)| p.group_ok && (!p.delete_source || *d));
+        let keep_reason = if all_ok {
+            None
+        } else if complete {
+            Some("another file in this photo group failed; source kept")
+        } else {
+            Some("photo group incomplete; source kept")
+        };
+        for (p, d) in members {
+            self.emit_one(p, d, keep_reason);
+        }
+    }
+
+    fn emit_one(&mut self, p: Pending, durable: bool, keep_reason: Option<&str>) {
+        let item = self.new[p.k];
+        let (tag, text) = match p.outcome {
+            Ok(mut warn) => {
+                if p.delete_source {
+                    let add = if let Some(reason) = keep_reason {
+                        Some(reason.to_string())
+                    } else if !durable {
+                        Some("flush to disk failed; source kept".into())
+                    } else if let Err(e) = fs::remove_file(&item.src) {
+                        Some(format!("could not delete source: {e}"))
+                    } else {
+                        None
+                    };
+                    if let Some(msg) = add {
+                        warn = Some(match warn {
+                            Some(w) => format!("{w}; {msg}"),
+                            None => msg,
+                        });
+                    }
+                }
+                match warn {
+                    Some(w) => {
+                        self.s.warnings += 1;
+                        ("WARNING", format!("{}  ->  {}  ({w})", item.src.display(), item.rel_dest))
+                    }
+                    None => (if self.mode == Mode::Move { "MOVED" } else { "COPIED" }, format!("{}  ->  {}", item.src.display(), item.rel_dest)),
+                }
+            }
+            Err(e) => {
+                self.s.failed += 1;
+                ("FAILED", format!("{}  ->  {}  ({e})", item.src.display(), item.rel_dest))
+            }
+        };
+        self.log.line(tag, &text);
+        let _ = self.tx.send(XferMsg::Line(format!("{tag:<9} {text}")));
     }
 }
 
@@ -640,10 +713,19 @@ fn rename_in(item: &Item) -> Result<Hashes, String> {
 /// Consume exactly one file's chunks from the reader, even on error, so the
 /// stream stays aligned with the item list. Each chunk is written to the
 /// library and, if set, the second copy: the card is read once.
-fn copy_in(k: usize, item: &Item, second_root: Option<&Path>, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'static str)) -> Written {
+fn copy_in(
+    k: usize,
+    item: &Item,
+    second_root: Option<&Path>,
+    rx: &Receiver<Chunk>,
+    pool_tx: &Sender<Vec<u8>>,
+    send: &dyn Fn(u64, &'static str),
+) -> Written {
     let Some(dir) = item.dest.parent() else {
         // Still drain this file's chunks.
-        while let Ok(Chunk::Data(_)) = rx.recv() {}
+        while let Ok(Chunk::Data(buf, _)) = rx.recv() {
+            let _ = pool_tx.send(buf);
+        }
         return Written::Done { k, result: Err("bad destination".into()), copied: true };
     };
     let tmp = dir.join(format!(".{}.mootui-partial", item.name));
@@ -677,24 +759,26 @@ fn copy_in(k: usize, item: &Item, second_root: Option<&Path>, rx: &Receiver<Chun
     let mut n = 0u64;
     loop {
         match rx.recv() {
-            Ok(Chunk::Data(buf)) => {
+            Ok(Chunk::Data(buf, len)) => {
+                let data = &buf[..len];
                 if err.is_none() {
-                    h.update(&buf);
-                    quick.update(&buf);
+                    h.update(data);
+                    quick.update(data);
                     if let Some(f) = w.as_mut() {
-                        if let Err(e) = f.write_all(&buf) {
+                        if let Err(e) = f.write_all(data) {
                             err = Some(format!("write: {e}"));
                         }
                     }
                     let failed = match &mut second {
-                        Some(Second::Tmp { file, .. }) => file.write_all(&buf).err(),
+                        Some(Second::Tmp { file, .. }) => file.write_all(data).err(),
                         _ => None,
                     };
                     if let Some(e) = failed {
                         drop_second(&mut second, format!("write: {e}"));
                     }
                 }
-                n += buf.len() as u64;
+                n += len as u64;
+                let _ = pool_tx.send(buf);
                 send(n, "copying");
             }
             Ok(Chunk::End(r)) => {
@@ -892,6 +976,7 @@ fn reconcile(plan: &Plan, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<S
         trashed: 0,
         conflicts: plan.conflicts().count(),
         undated: plan.undated.len(),
+        scan_errors: plan.scan_errors.len(),
         cancelled: false,
         log_path,
         csv_path: None,

@@ -72,6 +72,8 @@ pub struct Item {
     pub status: Status,
     /// Content hash if the scan already computed it.
     pub full: Option<[u8; 32]>,
+    /// Basename-group index (RAW + JPEG + sidecars share a group).
+    pub group: usize,
 }
 
 #[derive(Clone)]
@@ -83,6 +85,7 @@ pub struct Plan {
     pub dup_mode: DupMode,
     pub items: Vec<Item>,
     pub undated: Vec<PathBuf>,
+    pub scan_errors: Vec<String>,
     pub ignored: usize,
     pub in_place: usize,
     pub trash_dups: bool,
@@ -134,15 +137,23 @@ fn check_import_paths(source: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn list_source(source: &Path, p: &Progress) -> (Vec<Cand>, usize) {
+fn list_source(source: &Path, p: &Progress) -> (Vec<Cand>, usize, Vec<String>) {
     let mut cands = Vec::new();
     let mut ignored = 0;
+    let mut errors = Vec::new();
     let walker = WalkDir::new(source)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
-    for e in walker.filter_map(Result::ok) {
+    for entry in walker {
+        let e = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                errors.push(err.to_string());
+                continue;
+            }
+        };
         if !e.file_type().is_file() {
             continue;
         }
@@ -152,13 +163,43 @@ fn list_source(source: &Path, p: &Progress) -> (Vec<Cand>, usize) {
             ignored += 1;
             continue;
         }
-        let Ok(m) = e.metadata() else { continue };
+        let m = match e.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                errors.push(format!("{}: {err}", e.path().display()));
+                continue;
+            }
+        };
         cands.push(Cand { path: e.into_path(), name, ext, size: m.len(), mtime: mtime_of(&m) });
         if cands.len() % 200 == 0 {
             p.tick(cands.len());
         }
     }
-    (cands, ignored)
+    (cands, ignored, errors)
+}
+
+/// Content-verify a single source file against catalog rows that share its
+/// name and size when either side is missing a capture date.
+fn match_by_content(cat: &Catalog, cand: &Cand, rows: &mut [Row], p: &Progress) -> Result<Option<(PathBuf, [u8; 32])>> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let Ok(cand_head) = hash_head(&cand.path) else { return Ok(None) };
+    library::ensure_hashes(cat, rows, false, p)?;
+    let mut head_matches: Vec<Row> = rows
+        .iter()
+        .filter(|r| r.head.as_deref() == Some(cand_head.as_slice()))
+        .cloned()
+        .collect();
+    if head_matches.is_empty() {
+        return Ok(None);
+    }
+    let Ok(cand_full) = hash_file(&cand.path) else { return Ok(None) };
+    library::ensure_hashes(cat, &mut head_matches, true, p)?;
+    if let Some(r) = head_matches.iter().find(|r| r.full.as_deref() == Some(cand_full.as_slice())) {
+        return Ok(Some((cat.root.join(&r.rel), cand_full)));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +217,12 @@ pub fn plan_import(
     check_import_paths(source, root)?;
     let cat = Catalog::open(root)?;
     let mut et = exif::Reader::new();
-    library::sync(&cat, cfg, &mut et, p)?;
+    let sync_stats = library::sync(&cat, cfg, &mut et, p)?;
+    let mut scan_errors = sync_stats.errors;
 
     p.phase("Listing files on source", 0);
-    let (cands, ignored) = list_source(source, p);
+    let (cands, ignored, src_errors) = list_source(source, p);
+    scan_errors.extend(src_errors);
     let n = cands.len();
 
     // Basename groups: DSCF0001.RAF / .JPG / .RAF.pp3 travel together.
@@ -228,8 +271,10 @@ pub fn plan_import(
     let group_meta = |g: usize| -> Option<&Meta> { rep_of[g].and_then(|r| metas.get(&cands[r].path)) };
 
     if dup_mode == DupMode::Suspected {
+        type UndatedEntry = (PathBuf, [u8; 32], Option<[u8; 32]>);
         p.phase("Checking for suspected duplicates", n);
         let mut seen: HashMap<(String, u64, String), PathBuf> = HashMap::new();
+        let mut seen_undated: HashMap<(String, u64), Vec<UndatedEntry>> = HashMap::new();
         for (g, (_, _, members)) in groups.iter().enumerate() {
             let capture = group_meta(g).and_then(|m| m.capture.clone());
             for &i in members {
@@ -238,21 +283,61 @@ pub fn plan_import(
                     continue;
                 }
                 let rows = cat.by_name_size(&c.name, c.size)?;
-                let hit = rows.iter().find(|r| r.capture.is_none() || capture.is_none() || r.capture == capture);
-                if let Some(r) = hit {
-                    status[i] = Some(Status::Duplicate {
-                        existing: root.join(&r.rel),
-                        rule: "suspected",
-                        hash: None,
-                        trashable: false,
-                    });
+                if let Some(cap) = &capture {
+                    if let Some(r) = rows.iter().find(|r| r.capture.as_deref() == Some(cap.as_str())) {
+                        status[i] = Some(Status::Duplicate {
+                            existing: root.join(&r.rel),
+                            rule: "suspected",
+                            hash: None,
+                            trashable: false,
+                        });
+                        continue;
+                    }
+                }
+                // Missing capture date on either side: don't guess — verify by content.
+                let mut ambiguous: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|r| capture.is_none() || r.capture.is_none())
+                    .collect();
+                if let Some((existing, h)) = match_by_content(&cat, c, &mut ambiguous, p)? {
+                    fulls[i] = Some(h);
+                    status[i] = Some(Status::Duplicate { existing, rule: "content", hash: Some(hex(&h)), trashable: false });
                     continue;
                 }
-                let key = (c.name.clone(), c.size, capture.clone().unwrap_or_default());
-                if let Some(prev) = seen.get(&key) {
-                    status[i] = Some(Status::Duplicate { existing: prev.clone(), rule: "suspected", hash: None, trashable: false });
-                } else {
-                    seen.insert(key, c.path.clone());
+                if let Some(cap) = &capture {
+                    let key = (c.name.clone(), c.size, cap.clone());
+                    if let Some(prev) = seen.get(&key) {
+                        status[i] = Some(Status::Duplicate { existing: prev.clone(), rule: "suspected", hash: None, trashable: false });
+                    } else {
+                        seen.insert(key, c.path.clone());
+                    }
+                } else if let Ok(head) = hash_head(&c.path) {
+                    let entry = seen_undated.entry((c.name.clone(), c.size)).or_default();
+                    let mut matched = None;
+                    let mut my_full = None;
+                    for (prev_path, prev_head, prev_full) in entry.iter_mut() {
+                        if *prev_head != head {
+                            continue;
+                        }
+                        if prev_full.is_none() {
+                            *prev_full = hash_file(prev_path).ok();
+                        }
+                        if my_full.is_none() {
+                            my_full = hash_file(&c.path).ok();
+                        }
+                        if let (Some(a), Some(b)) = (*prev_full, my_full) {
+                            if a == b {
+                                matched = Some((prev_path.clone(), b));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((existing, h)) = matched {
+                        fulls[i] = Some(h);
+                        status[i] = Some(Status::Duplicate { existing, rule: "content", hash: Some(hex(&h)), trashable: false });
+                    } else {
+                        entry.push((c.path.clone(), head, my_full));
+                    }
                 }
             }
         }
@@ -282,6 +367,7 @@ pub fn plan_import(
                 dest: PathBuf::new(),
                 status: Status::New,
                 full: fulls[i],
+                group: g,
             };
             if let Some(m) = meta {
                 item.capture = m.capture.clone().unwrap_or_default();
@@ -357,6 +443,7 @@ pub fn plan_import(
                 dest,
                 status,
                 full: None,
+                group: g,
             });
         }
     }
@@ -370,6 +457,7 @@ pub fn plan_import(
         dup_mode,
         items,
         undated,
+        scan_errors,
         ignored,
         in_place: 0,
         trash_dups: false,
@@ -486,7 +574,7 @@ fn verified_check(cat: &Catalog, cands: &[Cand], status: &mut [Option<Status>], 
 pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress) -> Result<Plan> {
     let cat = Catalog::open(root)?;
     let mut et = exif::Reader::new();
-    library::sync(&cat, cfg, &mut et, p)?;
+    let sync_stats = library::sync(&cat, cfg, &mut et, p)?;
     drop(et);
 
     let mut rows = cat.present()?;
@@ -560,7 +648,7 @@ pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress
     let mut planned: HashSet<String> = HashSet::new();
     let reorganize = kind == Kind::Reorganize;
 
-    for key in keys {
+    for (g, key) in keys.into_iter().enumerate() {
         let members = &groups[&key];
         let name_of = |i: usize| rows[i].rel.rsplit('/').next().unwrap_or(&rows[i].rel).to_string();
         let rep = members
@@ -593,6 +681,7 @@ pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress
                         trashable: !sorted(&r.rel),
                     },
                     full: None,
+                    group: g,
                 });
                 continue;
             }
@@ -623,6 +712,7 @@ pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress
                 rel_dest: expected,
                 status,
                 full: None,
+                group: g,
             });
         }
 
@@ -662,6 +752,7 @@ pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress
                         rel_dest: expected,
                         status,
                         full: None,
+                        group: g,
                     });
                 }
                 _ => in_place += 1,
@@ -678,6 +769,7 @@ pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress
         dup_mode: DupMode::Verified,
         items,
         undated,
+        scan_errors: sync_stats.errors,
         ignored: 0,
         in_place,
         trash_dups: cfg.trash_duplicates,

@@ -86,6 +86,49 @@ pub fn hash_head(p: &Path) -> io::Result<[u8; 32]> {
     Ok(*h.finalize().as_bytes())
 }
 
+/// hash_head computed from the file's bytes as they stream past, so a copy
+/// doesn't need to reopen the file for it. Keeps the first and last 64 KB.
+pub struct HeadHasher {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    len: u64,
+}
+
+impl HeadHasher {
+    pub fn new() -> Self {
+        HeadHasher { head: Vec::with_capacity(HEAD as usize), tail: Vec::with_capacity(HEAD as usize), len: 0 }
+    }
+
+    pub fn update(&mut self, b: &[u8]) {
+        let h = HEAD as usize;
+        let room = h - self.head.len();
+        self.head.extend_from_slice(&b[..room.min(b.len())]);
+        if b.len() >= h {
+            self.tail.clear();
+            self.tail.extend_from_slice(&b[b.len() - h..]);
+        } else {
+            self.tail.extend_from_slice(b);
+            if self.tail.len() > h {
+                self.tail.drain(..self.tail.len() - h);
+            }
+        }
+        self.len += b.len() as u64;
+    }
+
+    /// Same value as hash_head on the same bytes: size, the first 64 KB, then
+    /// whatever lies past the first 64 KB within the last 64 KB.
+    pub fn finalize(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&self.len.to_le_bytes());
+        h.update(&self.head);
+        if self.len > HEAD {
+            let k = (self.len - HEAD).min(HEAD) as usize;
+            h.update(&self.tail[self.tail.len() - k..]);
+        }
+        *h.finalize().as_bytes()
+    }
+}
+
 /// Read until the buffer is full or EOF.
 pub fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
@@ -153,4 +196,33 @@ pub fn tilde(p: &Path) -> String {
 pub fn is_cloud_synced(p: &Path) -> bool {
     let s = p.to_string_lossy();
     s.contains("/Library/CloudStorage/") || s.contains("/Library/Mobile Documents/") || s.contains("/Dropbox/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_hasher_matches_hash_head() {
+        let dir = std::env::temp_dir().join(format!("mootui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = HEAD as usize;
+        for size in [0, 1, h - 1, h, h + 1, h + 1000, 2 * h - 1, 2 * h, 2 * h + 1, 3 * h + 7, 1 << 20] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            let p = dir.join(format!("{size}.bin"));
+            std::fs::write(&p, &data).unwrap();
+            let want = hash_head(&p).unwrap();
+            for chunk in [1, 4096, h - 3, h + 5, 1 << 20] {
+                if chunk == 1 && size > 3 * h {
+                    continue; // slow, and covered by the smaller sizes
+                }
+                let mut q = HeadHasher::new();
+                for c in data.chunks(chunk) {
+                    q.update(c);
+                }
+                assert_eq!(q.finalize(), want, "size {size}, chunk {chunk}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

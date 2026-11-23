@@ -156,14 +156,51 @@ pub fn norm_capture(v: &str) -> Option<String> {
 
 /// Per-file fallback when exiftool is absent or found nothing.
 pub fn fallback(p: &Path) -> Meta {
-    if media::is_image(&media::ext_lower(&p.to_string_lossy())) {
-        if let Ok(o) = Command::new("sips").args(["-g", "creation"]).arg(p).output() {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if let Some(c) = s.lines().find_map(|l| l.trim().strip_prefix("creation:")).and_then(norm_capture) {
-                return Meta { capture: Some(c), src: "sips".into(), camera: None };
+    fallback_all(&[p]).remove(p).unwrap_or_else(|| birthtime(p))
+}
+
+/// The fallback for many files: sips for the images, in batches (one
+/// process per 100 files, not per file), then the filesystem birth time.
+fn fallback_all(paths: &[&Path]) -> HashMap<PathBuf, Meta> {
+    let images: Vec<&Path> = paths.iter().copied().filter(|p| media::is_image(&media::ext_lower(&p.to_string_lossy()))).collect();
+    let mut dated = HashMap::new();
+    for chunk in images.chunks(100) {
+        dated.extend(sips_dates(chunk));
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let m = match dated.remove(*p) {
+                Some(c) => Meta { capture: Some(c), src: "sips".into(), camera: None },
+                None => birthtime(p),
+            };
+            (p.to_path_buf(), m)
+        })
+        .collect()
+}
+
+/// `sips -g creation a b c` prints each readable path as given, then an
+/// indented "creation: ..." line; unreadable files only warn on stderr.
+fn sips_dates(paths: &[&Path]) -> HashMap<PathBuf, String> {
+    let mut out = HashMap::new();
+    let Ok(o) = Command::new("sips").args(["-g", "creation"]).args(paths).stderr(Stdio::null()).output() else {
+        return out;
+    };
+    let by_name: HashMap<String, &Path> = paths.iter().map(|p| (p.to_string_lossy().into_owned(), *p)).collect();
+    let mut cur: Option<&Path> = None;
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        if let Some(v) = line.trim_start().strip_prefix("creation:") {
+            if let (Some(p), Some(c)) = (cur, norm_capture(v)) {
+                out.insert(p.to_path_buf(), c);
             }
+        } else if !line.starts_with(' ') {
+            cur = by_name.get(line).copied();
         }
     }
+    out
+}
+
+fn birthtime(p: &Path) -> Meta {
     let capture = fs::metadata(p)
         .and_then(|m| m.created())
         .ok()
@@ -206,17 +243,13 @@ pub fn read_all(r: &mut Reader, paths: &[PathBuf], mut tick: impl FnMut(usize), 
             tick(done);
         }
     }
-    for p in rest {
-        if cancel() {
-            break;
-        }
-        let have = out.get(p).is_some_and(|m| m.capture.is_some());
-        if !have {
-            let camera = out.get(p).and_then(|m| m.camera.clone());
-            let mut m = fallback(p);
-            m.camera = m.camera.or(camera);
-            out.insert(p.to_path_buf(), m);
-        }
+    if cancel() {
+        return out;
+    }
+    let undated: Vec<&Path> = rest.into_iter().filter(|p| out.get(*p).is_none_or(|m| m.capture.is_none())).collect();
+    for (p, mut m) in fallback_all(&undated) {
+        m.camera = m.camera.or_else(|| out.get(&p).and_then(|e| e.camera.clone()));
+        out.insert(p, m);
     }
     out
 }

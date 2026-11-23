@@ -29,7 +29,7 @@ use crate::catalog::{Catalog, NewRow};
 use crate::config::LibraryConfig;
 use crate::jobs::Progress;
 use crate::plan::{Item, Kind, Plan, Status};
-use crate::util::{csv_field, hash_file, hash_head, home, human_bytes, now, read_full, tilde};
+use crate::util::{csv_field, hash_file, home, human_bytes, now, read_full, tilde, HeadHasher};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -331,7 +331,7 @@ type Hashes = (Option<[u8; 32]>, Option<[u8; 32]>);
 /// Files handed from the writer to the finisher, in plan order.
 enum Written {
     /// Fully streamed to `tmp`; still to be flushed, verified and renamed.
-    Copied { k: usize, tmp: PathBuf, file: File, hash: [u8; 32] },
+    Copied { k: usize, tmp: PathBuf, file: File, hash: [u8; 32], head: [u8; 32] },
     /// Already settled: a same-disk rename, or a copy that failed.
     Done { k: usize, result: Result<Hashes, String>, copied: bool },
     Cancelled { remaining: usize },
@@ -371,8 +371,8 @@ impl Finisher<'_> {
     fn run(mut self, rx: Receiver<Written>) -> (Catalog, Log, Summary) {
         for w in rx {
             match w {
-                Written::Copied { k, tmp, file, hash } => {
-                    let r = finish_copy(self.new[k], &tmp, &file, hash);
+                Written::Copied { k, tmp, file, hash, head } => {
+                    let r = finish_copy(self.new[k], &tmp, &file, hash, head);
                     if r.is_err() {
                         let _ = fs::remove_file(&tmp);
                     } else {
@@ -515,12 +515,14 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
     };
 
     let mut h = blake3::Hasher::new();
+    let mut quick = HeadHasher::new();
     let mut n = 0u64;
     loop {
         match rx.recv() {
             Ok(Chunk::Data(buf)) => {
                 if err.is_none() {
                     h.update(&buf);
+                    quick.update(&buf);
                     if let Some(f) = w.as_mut() {
                         if let Err(e) = f.write_all(&buf) {
                             err = Some(format!("write: {e}"));
@@ -544,7 +546,7 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
     }
 
     match (err, w) {
-        (None, Some(file)) => Written::Copied { k, tmp, file, hash: *h.finalize().as_bytes() },
+        (None, Some(file)) => Written::Copied { k, tmp, file, hash: *h.finalize().as_bytes(), head: quick.finalize() },
         (err, _) => {
             let _ = fs::remove_file(&tmp);
             Written::Done { k, result: Err(err.unwrap_or_else(|| "no file".into())), copied: true }
@@ -553,7 +555,9 @@ fn copy_in(k: usize, item: &Item, rx: &Receiver<Chunk>, send: &dyn Fn(u64, &'sta
 }
 
 /// Runs on the finisher thread: copy times, fsync, verify, rename into place.
-fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32]) -> Result<Hashes, String> {
+/// Both hashes were taken from the stream; the full re-read confirms the
+/// copy holds those same bytes, so the quick hash holds for it too.
+fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32], head: [u8; 32]) -> Result<Hashes, String> {
     if let Ok(meta) = fs::metadata(&item.src) {
         let mut times = fs::FileTimes::new();
         if let Ok(t) = meta.modified() {
@@ -575,12 +579,11 @@ fn finish_copy(item: &Item, tmp: &Path, f: &File, streamed: [u8; 32]) -> Result<
     if streamed != written || item.full.is_some_and(|f| f != streamed) {
         return Err("verification failed: copy does not match source".into());
     }
-    let head = hash_head(tmp).ok();
     if item.dest.exists() {
         return Err("exists at destination".into());
     }
     fs::rename(tmp, &item.dest).map_err(|e| format!("rename: {e}"))?;
-    Ok((head, Some(streamed)))
+    Ok((Some(head), Some(streamed)))
 }
 
 /// Plain fsync(2): hands the data to the drive. Unlike std's sync_all on

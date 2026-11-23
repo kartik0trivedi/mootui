@@ -4,9 +4,9 @@
 //!   1. bring the catalog up to date (cheap: stat only, EXIF for new files)
 //!   2. list the source
 //!   3. duplicates FIRST, so known files are never dated or read in full:
-//!        suspected  original name + size + capture time (Lightroom's rule)
-//!        verified   size -> 128 KB quick hash -> full hash, staged; library
-//!                   hashes come from the catalog, computed once ever
+//!      - suspected: original name + size + capture time (Lightroom's rule)
+//!      - verified: size -> 128 KB quick hash -> full hash, staged; library
+//!        hashes come from the catalog, computed once ever
 //!   4. capture dates for what is left, one file per basename group
 //!   5. route through the layout template; sidecars follow their photo
 //!
@@ -468,7 +468,7 @@ fn verified_check(cat: &Catalog, cands: &[Cand], status: &mut [Option<Status>], 
         p.tick(k + 1);
         let Ok(h) = hash_file(&cands[i].path) else { continue };
         fulls[i] = Some(h);
-        if let Some(r) = lib_by_full.get(&h.to_vec()) {
+        if let Some(r) = lib_by_full.get(h.as_slice()) {
             status[i] = Some(Status::Duplicate { existing: cat.root.join(&r.rel), rule: "content", hash: Some(hex(&h)), trashable: false });
         } else if let Some(prev) = seen.get(&h) {
             status[i] = Some(Status::Duplicate { existing: prev.clone(), rule: "content", hash: Some(hex(&h)), trashable: false });

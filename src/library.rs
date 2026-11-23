@@ -194,7 +194,7 @@ pub fn ensure_hashes(cat: &Catalog, rows: &mut [Row], full: bool, p: &Progress) 
             let path = root.join(&rows[i].rel);
             let h = if full { hash_file(&path) } else { hash_head(&path) };
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n % 16 == 0 {
+            if n.is_multiple_of(16) {
                 p.tick(n);
             }
             (i, h.ok())

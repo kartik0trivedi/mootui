@@ -51,6 +51,9 @@ pub struct NewRow<'a> {
     pub import_id: Option<i64>,
 }
 
+/// (id, rel_path, size, mtime, present): what the library scan compares.
+pub type StatRow = (i64, String, u64, i64, bool);
+
 pub struct Interrupted {
     pub kind: String,
     pub started: String,
@@ -162,8 +165,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Every row, present or missing: path -> (id, size, mtime, present).
-    pub fn all_stat(&self) -> Result<Vec<(i64, String, u64, i64, bool)>> {
+    /// Every row, present or missing.
+    pub fn all_stat(&self) -> Result<Vec<StatRow>> {
         let mut st = self.conn.prepare("SELECT id, rel_path, size, mtime, state = 'present' FROM files")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get(3)?, r.get(4)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

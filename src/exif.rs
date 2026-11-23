@@ -151,7 +151,7 @@ pub fn norm_capture(v: &str) -> Option<String> {
     if !ok || !(1900..=2200).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    Some(format!("{date} {}", time.replace(':', ":")))
+    Some(format!("{date} {time}"))
 }
 
 /// Per-file fallback when exiftool is absent or found nothing.

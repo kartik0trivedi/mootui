@@ -24,7 +24,7 @@ use walkdir::WalkDir;
 
 use crate::catalog::{Catalog, Row};
 use crate::config::{DupMode, LibraryConfig};
-use crate::exif::{self, ExifTool, Meta};
+use crate::exif::{self, Meta};
 use crate::jobs::Progress;
 use crate::layout::{self, Fields};
 use crate::library::{self, mtime_of};
@@ -175,7 +175,7 @@ pub fn plan_import(
 ) -> Result<Plan> {
     check_import_paths(source, root)?;
     let cat = Catalog::open(root)?;
-    let mut et = ExifTool::start();
+    let mut et = exif::Reader::new();
     library::sync(&cat, cfg, &mut et, p)?;
 
     p.phase("Listing files on source", 0);
@@ -485,7 +485,7 @@ fn verified_check(cat: &Catalog, cands: &[Cand], status: &mut [Option<Status>], 
 
 pub fn plan_reconcile(root: &Path, cfg: &LibraryConfig, kind: Kind, p: &Progress) -> Result<Plan> {
     let cat = Catalog::open(root)?;
-    let mut et = ExifTool::start();
+    let mut et = exif::Reader::new();
     library::sync(&cat, cfg, &mut et, p)?;
     drop(et);
 

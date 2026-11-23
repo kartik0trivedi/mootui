@@ -207,7 +207,7 @@ Other details:
 
 - **Batched disk flushes.** Each copy gets an `fsync`, but the slow full flush of the drive's cache (`F_FULLFSYNC`) runs once per 64 files in move mode (before any of those originals are deleted) and once at the end of the run, not after every file.
 - **Batched catalog writes.** The catalog is written in transactions of 64 files.
-- **Fast date reads.** A single `exiftool -stay_open -fast2` process reads capture dates, only for one file per base-name group and only for files not already known to be duplicates.
+- **Fast date reads.** Capture dates are read only for one file per base-name group, and only for files not already known to be duplicates. A built-in EXIF reader handles JPEG, TIFF-based raws and Fujifilm RAF from each file's first 64 KB. Anything it can't date (HEIC, CR3, video, dates only in XMP) goes to a single `exiftool -stay_open -fast2` process, started only when needed. On a 1,464-file folder, planning went from 7–11 s to 0.1 s.
 - **No async runtime.** mootui uses plain threads and channels, because the job is bulk I/O limited by disk throughput.
 
 ## FAQ

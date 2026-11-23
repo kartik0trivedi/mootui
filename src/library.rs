@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 use crate::catalog::{Catalog, NewRow, Row};
 use crate::config::LibraryConfig;
-use crate::exif::{self, ExifTool};
+use crate::exif;
 use crate::jobs::Progress;
 use crate::media;
 use crate::util::{hash_file, hash_head, nfc};
@@ -80,7 +80,7 @@ pub struct SyncStats {
     pub total: usize,
 }
 
-pub fn sync(cat: &Catalog, cfg: &LibraryConfig, exif: &mut Option<ExifTool>, p: &Progress) -> Result<SyncStats> {
+pub fn sync(cat: &Catalog, cfg: &LibraryConfig, exif: &mut exif::Reader, p: &Progress) -> Result<SyncStats> {
     p.phase("Checking library for changes", 0);
     let disk = walk(&cat.root, cfg);
     let known: HashMap<String, (i64, u64, i64, bool)> =

@@ -13,6 +13,7 @@
 mod catalog;
 mod config;
 mod exif;
+mod exif_native;
 mod jobs;
 mod layout;
 mod library;
@@ -198,7 +199,7 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
     if args.index {
         let r = root.clone();
         thread::spawn(move || {
-            let mut et = exif::ExifTool::start();
+            let mut et = exif::Reader::new();
             let res = Catalog::open(&r)
                 .map_err(|e| e.to_string())
                 .and_then(|c| library::sync(&c, &cfg, &mut et, &p).map_err(|e| e.to_string()).map(|s| index_message(&s)));
@@ -546,7 +547,7 @@ impl App {
         let Some(lib) = &self.lib else { return };
         let (root, cfg) = (lib.root.clone(), lib.cfg.clone());
         self.start_job(title, move |p| {
-            let mut et = exif::ExifTool::start();
+            let mut et = exif::Reader::new();
             let res = Catalog::open(&root)
                 .map_err(|e| e.to_string())
                 .and_then(|c| library::sync(&c, &cfg, &mut et, &p).map_err(|e| format!("{e:#}")).map(|s| index_message(&s)));

@@ -1,5 +1,9 @@
 //! Capture dates and camera names.
 //!
+//! The native reader (exif_native) answers first for JPEG, TIFF-based raws
+//! and RAF. Only files it can't date go to exiftool, which is started the
+//! first time it is needed (a Perl start-up costs ~0.2 s).
+//!
 //! One exiftool process stays open for the whole run (-stay_open), fed batches
 //! (note: -q would suppress the "{ready}" marker that ends each batch)
 //! over a pipe, instead of a new process per batch. -fast2 stops it reading
@@ -101,6 +105,27 @@ impl ExifTool {
     }
 }
 
+/// exiftool, started on first use.
+#[derive(Default)]
+pub struct Reader {
+    tool: Option<ExifTool>,
+    tried: bool,
+}
+
+impl Reader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn tool(&mut self) -> Option<&mut ExifTool> {
+        if !self.tried {
+            self.tried = true;
+            self.tool = ExifTool::start();
+        }
+        self.tool.as_mut()
+    }
+}
+
 impl Drop for ExifTool {
     fn drop(&mut self) {
         let _ = self.stdin.write_all(b"-stay_open\nFalse\n");
@@ -146,23 +171,42 @@ pub fn fallback(p: &Path) -> Meta {
     Meta { capture, src: "birthtime".into(), camera: None }
 }
 
-/// Read many files: exiftool in batches (reporting progress), then the
-/// fallback for anything left without a date.
-pub fn read_all(exif: &mut Option<ExifTool>, paths: &[PathBuf], mut tick: impl FnMut(usize), cancel: &dyn Fn() -> bool) -> HashMap<PathBuf, Meta> {
+/// Read many files: the native reader, then exiftool in batches for what it
+/// couldn't date, then the fallback for anything still without a date.
+/// Progress counts files settled, so it only moves forward.
+pub fn read_all(r: &mut Reader, paths: &[PathBuf], mut tick: impl FnMut(usize), cancel: &dyn Fn() -> bool) -> HashMap<PathBuf, Meta> {
     let mut out: HashMap<PathBuf, Meta> = HashMap::new();
-    let mut done = 0;
-    if let Some(et) = exif.as_mut() {
-        for chunk in paths.chunks(100) {
+    let mut rest: Vec<&Path> = Vec::new();
+    for (k, p) in paths.iter().enumerate() {
+        if cancel() {
+            return out;
+        }
+        match crate::exif_native::read(p) {
+            Some(m) => {
+                out.insert(p.clone(), m);
+            }
+            None => rest.push(p),
+        }
+        if k % 50 == 49 {
+            tick(out.len());
+        }
+    }
+    let mut done = out.len();
+    tick(done);
+    if rest.is_empty() {
+        return out;
+    }
+    if let Some(et) = r.tool() {
+        for chunk in rest.chunks(100) {
             if cancel() {
                 return out;
             }
-            let refs: Vec<&Path> = chunk.iter().map(|p| p.as_path()).collect();
-            out.extend(et.read(&refs));
+            out.extend(et.read(chunk));
             done += chunk.len();
             tick(done);
         }
     }
-    for p in paths {
+    for p in rest {
         if cancel() {
             break;
         }
@@ -171,8 +215,60 @@ pub fn read_all(exif: &mut Option<ExifTool>, paths: &[PathBuf], mut tick: impl F
             let camera = out.get(p).and_then(|m| m.camera.clone());
             let mut m = fallback(p);
             m.camera = m.camera.or(camera);
-            out.insert(p.clone(), m);
+            out.insert(p.to_path_buf(), m);
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compare the native reader with exiftool on real files:
+    ///   MOOTUI_EXIF_CORPUS=~/Pictures cargo test --release corpus -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn corpus_matches_exiftool() {
+        let dir = std::env::var("MOOTUI_EXIF_CORPUS").expect("set MOOTUI_EXIF_CORPUS");
+        let paths: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file() && !e.file_name().to_string_lossy().starts_with('.'))
+            .filter(|e| media::is_image(&media::ext_lower(&e.file_name().to_string_lossy())))
+            .map(|e| e.into_path())
+            .collect();
+
+        let t = std::time::Instant::now();
+        let native: Vec<Option<Meta>> = paths.iter().map(|p| crate::exif_native::read(p)).collect();
+        let t_native = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let mut et = ExifTool::start().expect("exiftool not installed");
+        let mut reference = HashMap::new();
+        for chunk in paths.chunks(100) {
+            let refs: Vec<&Path> = chunk.iter().map(|p| p.as_path()).collect();
+            reference.extend(et.read(&refs));
+        }
+        let t_exiftool = t.elapsed();
+
+        let (mut hit, mut miss, mut bad) = (0, 0, Vec::new());
+        for (p, n) in paths.iter().zip(&native) {
+            let Some(n) = n else {
+                miss += 1;
+                continue;
+            };
+            hit += 1;
+            let e = reference.get(p).cloned().unwrap_or_default();
+            if (&n.capture, &n.src, &n.camera) != (&e.capture, &e.src, &e.camera) {
+                bad.push(format!("{}: native {:?} {} {:?} / exiftool {:?} {} {:?}", p.display(), n.capture, n.src, n.camera, e.capture, e.src, e.camera));
+            }
+        }
+        println!("{} files: native dated {hit}, left {miss} to exiftool", paths.len());
+        println!("native {t_native:.2?} for all, exiftool {t_exiftool:.2?} for all");
+        for b in bad.iter().take(20) {
+            println!("MISMATCH {b}");
+        }
+        assert!(bad.is_empty(), "{} mismatches", bad.len());
+    }
 }

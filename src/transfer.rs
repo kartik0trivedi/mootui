@@ -804,7 +804,7 @@ pub fn undo(root: &Path, cfg: &LibraryConfig) -> Result<String> {
     }
     cat.mark_undone(id)?;
     // Files restored from the Trash were dropped from the catalog; re-adopt.
-    let mut et = crate::exif::ExifTool::start();
+    let mut et = crate::exif::Reader::new();
     crate::library::sync(&cat, cfg, &mut et, &Progress::silent())?;
     log.raw("");
     log.raw(&format!("result     {ok} restored, {skipped} skipped"));

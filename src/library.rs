@@ -12,7 +12,6 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use walkdir::WalkDir;
 
 use crate::catalog::{Catalog, NewRow, Row};
 use crate::config::LibraryConfig;
@@ -54,23 +53,43 @@ pub fn is_excluded_dir(name: &str, cfg: &LibraryConfig) -> bool {
     })
 }
 
+/// Every media file in the library, sorted by path. Folders are read in
+/// parallel and so are the stats within a folder: each readdir and stat
+/// mostly waits on the disk, so keeping many in flight finishes sooner,
+/// above all on external and network disks. (A card is still listed in
+/// order, in plan.rs: it reads fastest sequentially.)
 pub fn walk(root: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
-    let mut out = Vec::new();
-    let it = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
-        e.depth() == 0 || !(e.file_type().is_dir() && is_excluded_dir(&e.file_name().to_string_lossy(), cfg))
-    });
-    for e in it.filter_map(Result::ok) {
-        if !e.file_type().is_file() {
-            continue;
+    let mut out = walk_dir(root, root, cfg);
+    out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// Symlinks are not followed, hidden files and excluded folders are skipped.
+fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if ft.is_dir() {
+            if !is_excluded_dir(&name, cfg) {
+                subdirs.push(e.path());
+            }
+        } else if ft.is_file() && !name.starts_with('.') && media::is_media(&media::ext_lower(&name)) {
+            files.push(e.path());
         }
-        let name = e.file_name().to_string_lossy();
-        if name.starts_with('.') || !media::is_media(&media::ext_lower(&name)) {
-            continue;
-        }
-        let Ok(rel) = e.path().strip_prefix(root) else { continue };
-        let Ok(m) = e.metadata() else { continue };
-        out.push(DiskFile { rel: rel.to_string_lossy().into_owned(), abs: e.path().to_path_buf(), size: m.len(), mtime: mtime_of(&m) });
     }
+    let mut out: Vec<DiskFile> = files
+        .into_par_iter()
+        .filter_map(|abs| {
+            let m = fs::symlink_metadata(&abs).ok()?;
+            let rel = abs.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            Some(DiskFile { rel, size: m.len(), mtime: mtime_of(&m), abs })
+        })
+        .collect();
+    out.par_extend(subdirs.par_iter().flat_map_iter(|d| walk_dir(root, d, cfg)));
     out
 }
 
@@ -184,4 +203,82 @@ pub fn ensure_hashes(cat: &Catalog, rows: &mut [Row], full: bool, p: &Progress) 
         bail!("cancelled");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walkdir::WalkDir;
+
+    /// The serial walk this replaced, kept as the reference.
+    fn walk_serial(root: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
+        let mut out = Vec::new();
+        let it = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+            e.depth() == 0 || !(e.file_type().is_dir() && is_excluded_dir(&e.file_name().to_string_lossy(), cfg))
+        });
+        for e in it.filter_map(Result::ok) {
+            if !e.file_type().is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy();
+            if name.starts_with('.') || !media::is_media(&media::ext_lower(&name)) {
+                continue;
+            }
+            let Ok(rel) = e.path().strip_prefix(root) else { continue };
+            let Ok(m) = e.metadata() else { continue };
+            out.push(DiskFile { rel: rel.to_string_lossy().into_owned(), abs: e.path().to_path_buf(), size: m.len(), mtime: mtime_of(&m) });
+        }
+        out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
+        out
+    }
+
+    fn same(a: &[DiskFile], b: &[DiskFile]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (&x.rel, &x.abs, x.size, x.mtime) == (&y.rel, &y.abs, y.size, y.mtime))
+    }
+
+    #[test]
+    fn parallel_walk_matches_serial() {
+        let root = std::env::temp_dir().join(format!("mootui-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for d in ["2026-01/RAW", "2026-01/JPG", "loose", ".hidden", "LOG", "x.photoslibrary/originals", "deep/a/b/c/d"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for (i, f) in [
+            "2026-01/RAW/A.RAF", "2026-01/RAW/A.RAF.pp3", "2026-01/JPG/A.JPG", "loose/b.jpg", "loose/notes.txt", "loose/.c.jpg",
+            ".hidden/d.jpg", "LOG/e.jpg", "x.photoslibrary/originals/f.heic", "deep/a/b/c/d/g.mov", "top.dng",
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(root.join(f), vec![0u8; i * 10]).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("loose/b.jpg"), root.join("loose/link.jpg")).unwrap();
+        std::os::unix::fs::symlink(root.join("2026-01"), root.join("linked-dir")).unwrap();
+
+        let cfg = LibraryConfig::default();
+        let (new, old) = (walk(&root, &cfg), walk_serial(&root, &cfg));
+        fs::remove_dir_all(&root).unwrap();
+        let rels: Vec<&str> = new.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["2026-01/JPG/A.JPG", "2026-01/RAW/A.RAF", "2026-01/RAW/A.RAF.pp3", "deep/a/b/c/d/g.mov", "loose/b.jpg", "top.dng"]);
+        assert!(same(&new, &old));
+    }
+
+    /// Compare and time both walks on a real folder (read-only):
+    ///   MOOTUI_WALK_CORPUS=~/Pictures cargo test --release walk_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn walk_corpus() {
+        let root = PathBuf::from(std::env::var("MOOTUI_WALK_CORPUS").expect("set MOOTUI_WALK_CORPUS"));
+        let cfg = LibraryConfig::default();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let old = walk_serial(&root, &cfg);
+            let t_old = t.elapsed();
+            let t = std::time::Instant::now();
+            let new = walk(&root, &cfg);
+            let t_new = t.elapsed();
+            println!("{} files: serial {t_old:.2?}, parallel {t_new:.2?}", new.len());
+            assert!(same(&new, &old));
+        }
+    }
 }

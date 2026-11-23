@@ -2,10 +2,12 @@
 # Compare mootui's import speed with the Mac's own copy tools, reading from a
 # real card with a cold cache every run.
 #
-#   sudo ./bench-copy.sh [SOURCE] [RUNS]
+#   sudo ./bench-copy.sh [SOURCE] [RUNS] [BASE]
 #
 #   SOURCE  folder on the card (default: /Volumes/Untitled/DCIM)
 #   RUNS    runs per tool (default: 3)
+#   BASE    another mootui binary to time as "mootui-base", e.g. a build of
+#           an older commit, to see what a change did
 #
 # sudo is only used for `purge` (drops the file cache between runs, so every
 # run really reads the card). Every copy runs as you, not root. The card is
@@ -16,12 +18,14 @@ SRC=${1:-/Volumes/Untitled/DCIM}
 RUNS=${2:-3}
 HERE=${0:A:h}
 MOOTUI=$HERE/target/release/mootui
+BASE=${3:-}
 
 if [[ $EUID -ne 0 || -z ${SUDO_USER:-} ]]; then
   echo "run with sudo: sudo $0 $*" >&2; exit 1
 fi
 [[ -d $SRC ]] || { echo "no such folder: $SRC" >&2; exit 1; }
 [[ -x $MOOTUI ]] || { echo "build first: cargo build --release ($MOOTUI missing)" >&2; exit 1; }
+[[ -z $BASE || -x $BASE ]] || { echo "no such binary: $BASE" >&2; exit 1; }
 
 USR=$SUDO_USER
 UID_=$(id -u $USR)
@@ -72,10 +76,15 @@ run "cp -R"    as_user cp -R "$SRC" "$DEST/out/"
 run "ditto"    as_user ditto "$SRC" "$DEST/out/$NAME"
 run "Finder"   as_gui  osascript -e "tell application \"Finder\" to duplicate (POSIX file \"$SRC\" as alias) to (POSIX file \"$DEST/out\" as alias)"
 run "mootui"   as_user "$MOOTUI" --library "$DEST/out" --yes "$SRC"
+LABELS=("cp -R" "ditto" "Finder" "mootui")
+if [[ -n $BASE ]]; then
+  run "mootui-base" as_user "$BASE" --library "$DEST/out" --yes "$SRC"
+  LABELS+=("mootui-base")
+fi
 
 echo "\naverage"
-for label in "cp -R" "ditto" "Finder" "mootui"; do
+for label in "${LABELS[@]}"; do
   s=${total[$label]}
-  printf "  %-10s %6.2f s  %6.1f MB/s\n" "$label" $s $(( MB / s ))
+  printf "  %-12s %6.2f s  %6.1f MB/s\n" "$label" $s $(( MB / s ))
 done
 echo "\nmootui's time includes planning (EXIF dates, duplicate check) and verifying every copy."

@@ -29,6 +29,7 @@ use crate::catalog::{Catalog, NewRow};
 use crate::config::LibraryConfig;
 use crate::jobs::Progress;
 use crate::plan::{Item, Kind, Plan, Status};
+use crate::second;
 use crate::util::{csv_field, hash_file, home, human_bytes, now, read_full, tilde, HeadHasher};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,9 @@ pub struct Summary {
     pub second: Option<PathBuf>,
     /// Files whose second copy failed (they are in the library).
     pub second_failed: usize,
+    /// Files already in the library that were missing from the second copy
+    /// (e.g. after an interrupted import) and were copied there.
+    pub second_caught_up: usize,
 }
 
 pub enum XferMsg {
@@ -263,16 +267,7 @@ fn spawn_reader(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>) -> Receiver<Chunk>
 fn preflight(plan: &Plan, second: Option<&Path>, need_lib: u64, need_second: u64) -> Result<()> {
     let mut need: Vec<(u64, &Path, u64)> = vec![(fs::metadata(&plan.root)?.dev(), &plan.root, need_lib)];
     if let Some(sec) = second {
-        if !sec.is_dir() {
-            bail!("Second copy folder not found: {} (is the drive connected?)", tilde(sec));
-        }
-        let sc = fs::canonicalize(sec)?;
-        for (other, what) in [(&plan.root, "library"), (&plan.source, "source")] {
-            let o = fs::canonicalize(other)?;
-            if sc.starts_with(&o) || o.starts_with(&sc) {
-                bail!("The second copy folder {} overlaps the {what} ({})", tilde(sec), tilde(other));
-            }
-        }
+        second::check_folder(sec, &plan.root, Some(&plan.source))?;
         let dev = fs::metadata(sec)?.dev();
         match need.iter_mut().find(|(d, _, _)| *d == dev) {
             Some(n) => n.2 += need_second,
@@ -290,7 +285,7 @@ fn preflight(plan: &Plan, second: Option<&Path>, need_lib: u64, need_second: u64
 }
 
 /// Space available to this user on the disk holding `p`.
-fn free_bytes(p: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(p: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     // SAFETY: c is a valid NUL-terminated path and st a valid out-pointer.
@@ -309,6 +304,7 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         .collect();
     let need_lib = new.iter().zip(&renames).filter(|(_, r)| !**r).map(|(i, _)| i.size).sum();
     preflight(plan, second, need_lib, plan.new_bytes())?;
+    let _second_lock = second.map(second::lock).transpose()?;
 
     let cat = Catalog::open(&plan.root)?;
     let vol = plan.volume.as_ref().map(|(n, u)| (n.as_str(), u.as_str()));
@@ -338,6 +334,7 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         note: None,
         second: second.map(Path::to_path_buf),
         second_failed: 0,
+        second_caught_up: 0,
     };
 
     let (ftx, frx) = sync_channel::<Written>(FINISH_QUEUE);
@@ -384,6 +381,11 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         handle.join().expect("finisher thread panicked")
     });
 
+    let mut s = s;
+    if let (Some(sec), false) = (second, s.cancelled) {
+        catch_up_duplicates(plan, sec, cancel, tx, &mut log, &mut s);
+    }
+
     let _ = tx.send(XferMsg::Progress { files_done: s.transferred + s.failed, bytes_done: s.bytes, current: String::new(), phase: "done" });
     footer(&mut log, &s);
     cat.finish_import(
@@ -394,6 +396,49 @@ fn import(plan: &Plan, mode: Mode, second: Option<&Path>, cancel: &AtomicBool, t
         ),
     )?;
     Ok(s)
+}
+
+/// Files this import skipped as already in the library may still be missing
+/// from the second copy: the run that brought them in was interrupted, or
+/// their second copy failed, or the second copy was set up later. Copy those
+/// from the library (not the card).
+fn catch_up_duplicates(plan: &Plan, sec: &Path, cancel: &AtomicBool, tx: &Sender<XferMsg>, log: &mut Log, s: &mut Summary) {
+    let mut rels: Vec<String> = plan
+        .duplicates()
+        .filter_map(|d| match &d.status {
+            Status::Duplicate { existing, .. } => existing.strip_prefix(&plan.root).ok().map(|r| r.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    rels.sort();
+    rels.dedup();
+    if rels.is_empty() {
+        return;
+    }
+    let files_done = s.transferred + s.failed;
+    let r = second::catch_up(&plan.root, sec, &rels, &|| cancel.load(Ordering::Relaxed), &mut |rel, _| {
+        log.line("2ND COPY", &format!("{rel}  (already in the library; was missing from the second copy)"));
+        let _ = tx.send(XferMsg::Line(format!("2ND COPY  {rel}")));
+        let _ = tx.send(XferMsg::Progress { files_done, bytes_done: s.bytes, current: rel.to_string(), phase: "second copy" });
+    });
+    match r {
+        Ok(r) => {
+            s.second_caught_up = r.copied;
+            for rel in &r.different {
+                s.second_failed += 1;
+                log.line("WARNING", &format!("{rel}: a different file is already in the second copy; left alone"));
+            }
+            for (rel, e) in &r.failed {
+                s.second_failed += 1;
+                log.line("WARNING", &format!("{rel}: second copy failed: {e}"));
+            }
+            s.warnings += r.different.len() + r.failed.len();
+        }
+        Err(e) => {
+            s.warnings += 1;
+            log.line("WARNING", &format!("second copy catch-up: {e:#}"));
+        }
+    }
 }
 
 type Hashes = (Option<[u8; 32]>, Option<[u8; 32]>);
@@ -612,13 +657,18 @@ fn copy_in(k: usize, item: &Item, second_root: Option<&Path>, rx: &Receiver<Chun
             err = Some("exists at destination".into());
             None
         }
-        Ok(()) => match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                err = Some(format!("create: {e}"));
-                None
+        Ok(()) => {
+            // A partial file here is left by a crashed run: the library lock
+            // rules out a live one.
+            let _ = fs::remove_file(&tmp);
+            match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    err = Some(format!("create: {e}"));
+                    None
+                }
             }
-        },
+        }
     };
     let mut second = if err.is_none() { second_root.map(|r| open_second(r, item)) } else { None };
 
@@ -681,6 +731,7 @@ fn open_second(root: &Path, item: &Item) -> Second {
         return Second::Existing(dest);
     }
     let tmp = dir.join(format!(".{}.mootui-partial", item.name));
+    let _ = fs::remove_file(&tmp); // left by a crashed run; the second-copy lock rules out a live one
     match OpenOptions::new().write(true).create_new(true).open(&tmp) {
         Ok(file) => Second::Tmp { tmp, file, dest },
         Err(e) => Second::Failed(format!("create: {e}")),
@@ -698,7 +749,7 @@ fn drop_second(second: &mut Option<Second>, why: String) {
 }
 
 /// Copy the source's modified, accessed (and on macOS created) times.
-fn copy_times(src: &Path, f: &File) {
+pub(crate) fn copy_times(src: &Path, f: &File) {
     if let Ok(meta) = fs::metadata(src) {
         let mut times = fs::FileTimes::new();
         if let Ok(t) = meta.modified() {
@@ -769,7 +820,7 @@ fn finish_second(item: &Item, second: Second, streamed: [u8; 32]) -> Result<Opti
 /// Plain fsync(2): hands the data to the drive. Unlike std's sync_all on
 /// macOS it does not also flush the drive's cache (F_FULLFSYNC), which is
 /// slow per file; Finisher::flush does that once per batch instead.
-fn fsync(f: &File) -> std::io::Result<()> {
+pub(crate) fn fsync(f: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: fd is valid for the lifetime of `f`.
     if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
@@ -847,6 +898,7 @@ fn reconcile(plan: &Plan, cancel: &AtomicBool, tx: &Sender<XferMsg>) -> Result<S
         note: None,
         second: None,
         second_failed: 0,
+        second_caught_up: 0,
     };
 
     let moves: Vec<&Item> = plan.new_items().collect();

@@ -51,6 +51,18 @@ pub struct NewRow<'a> {
     pub import_id: Option<i64>,
 }
 
+pub struct Interrupted {
+    pub kind: String,
+    pub started: String,
+    pub source: String,
+    pub volume: Option<String>,
+    /// Files catalogued by the run before it stopped. Only a lower bound:
+    /// the batch in progress is lost, and its files are re-adopted without
+    /// the import's id, so this is kept for the record, not shown.
+    pub files: i64,
+    pub moves: i64,
+}
+
 pub struct Move {
     pub from: String,
     pub to: String,
@@ -271,6 +283,31 @@ impl Catalog {
     }
 
     /// Most recent tidy/reorganize that moved something and was not undone.
+    /// Runs that started but never finished (mootui was killed, or the Mac
+    /// lost power). Marked finished here, as interrupted, so each one is
+    /// reported once. Call with the library lock held, so a run in progress
+    /// elsewhere can't be mistaken for one.
+    pub fn close_interrupted(&self) -> Result<Vec<Interrupted>> {
+        let mut st = self.conn.prepare(
+            "SELECT i.id, i.kind, i.started, COALESCE(i.source, ''), i.volume_name,
+                    (SELECT COUNT(*) FROM files f WHERE f.import_id = i.id),
+                    (SELECT COUNT(*) FROM moves m WHERE m.import_id = i.id)
+             FROM imports i WHERE i.finished IS NULL ORDER BY i.id",
+        )?;
+        let runs: Vec<(i64, Interrupted)> = st
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    Interrupted { kind: r.get(1)?, started: r.get(2)?, source: r.get(3)?, volume: r.get(4)?, files: r.get(5)?, moves: r.get(6)? },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, run) in &runs {
+            self.finish_import(*id, &format!("{{\"interrupted\":true,\"files\":{},\"moves\":{}}}", run.files, run.moves))?;
+        }
+        Ok(runs.into_iter().map(|(_, r)| r).collect())
+    }
+
     pub fn last_undoable(&self) -> Result<Option<(i64, String, String)>> {
         Ok(self
             .conn

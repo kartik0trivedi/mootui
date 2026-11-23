@@ -58,17 +58,21 @@ pub fn is_excluded_dir(name: &str, cfg: &LibraryConfig) -> bool {
 /// mostly waits on the disk, so keeping many in flight finishes sooner,
 /// above all on external and network disks. (A card is still listed in
 /// order, in plan.rs: it reads fastest sequentially.)
-pub fn walk(root: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
-    let mut out = walk_dir(root, root, cfg);
+///
+/// Also returns any partial copies (hidden `.*.mootui-partial` files) left
+/// by a run that crashed.
+pub fn walk(root: &Path, cfg: &LibraryConfig) -> (Vec<DiskFile>, Vec<PathBuf>) {
+    let (mut out, partials) = walk_dir(root, root, cfg);
     out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
-    out
+    (out, partials)
 }
 
 /// Symlinks are not followed, hidden files and excluded folders are skipped.
-fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
-    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> (Vec<DiskFile>, Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
+    let mut partials = Vec::new();
     for e in rd.flatten() {
         let Ok(ft) = e.file_type() else { continue };
         let name = e.file_name();
@@ -79,6 +83,8 @@ fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
             }
         } else if ft.is_file() && !name.starts_with('.') && media::is_media(&media::ext_lower(&name)) {
             files.push(e.path());
+        } else if ft.is_file() && name.starts_with('.') && name.ends_with(".mootui-partial") {
+            partials.push(e.path());
         }
     }
     let mut out: Vec<DiskFile> = files
@@ -89,8 +95,10 @@ fn walk_dir(root: &Path, dir: &Path, cfg: &LibraryConfig) -> Vec<DiskFile> {
             Some(DiskFile { rel, size: m.len(), mtime: mtime_of(&m), abs })
         })
         .collect();
-    out.par_extend(subdirs.par_iter().flat_map_iter(|d| walk_dir(root, d, cfg)));
-    out
+    let (sub, sub_partials): (Vec<Vec<DiskFile>>, Vec<Vec<PathBuf>>) = subdirs.par_iter().map(|d| walk_dir(root, d, cfg)).unzip();
+    out.extend(sub.into_iter().flatten());
+    partials.extend(sub_partials.into_iter().flatten());
+    (out, partials)
 }
 
 pub struct SyncStats {
@@ -101,7 +109,12 @@ pub struct SyncStats {
 
 pub fn sync(cat: &Catalog, cfg: &LibraryConfig, exif: &mut exif::Reader, p: &Progress) -> Result<SyncStats> {
     p.phase("Checking library for changes", 0);
-    let disk = walk(&cat.root, cfg);
+    let (disk, partials) = walk(&cat.root, cfg);
+    // Every caller holds the library lock, so no run is writing these: they
+    // were left by one that crashed.
+    for f in partials {
+        let _ = fs::remove_file(f);
+    }
     let known: HashMap<String, (i64, u64, i64, bool)> =
         cat.all_stat()?.into_iter().map(|(id, rel, size, mtime, present)| (rel, (id, size, mtime, present))).collect();
 
@@ -255,8 +268,10 @@ mod tests {
         std::os::unix::fs::symlink(root.join("loose/b.jpg"), root.join("loose/link.jpg")).unwrap();
         std::os::unix::fs::symlink(root.join("2026-01"), root.join("linked-dir")).unwrap();
 
+        fs::write(root.join("loose/.b.jpg.mootui-partial"), b"half").unwrap();
         let cfg = LibraryConfig::default();
-        let (new, old) = (walk(&root, &cfg), walk_serial(&root, &cfg));
+        let ((new, partials), old) = (walk(&root, &cfg), walk_serial(&root, &cfg));
+        assert_eq!(partials, [root.join("loose/.b.jpg.mootui-partial")]);
         fs::remove_dir_all(&root).unwrap();
         let rels: Vec<&str> = new.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(rels, ["2026-01/JPG/A.JPG", "2026-01/RAW/A.RAF", "2026-01/RAW/A.RAF.pp3", "deep/a/b/c/d/g.mov", "loose/b.jpg", "top.dng"]);
@@ -275,7 +290,7 @@ mod tests {
             let old = walk_serial(&root, &cfg);
             let t_old = t.elapsed();
             let t = std::time::Instant::now();
-            let new = walk(&root, &cfg);
+            let new = walk(&root, &cfg).0;
             let t_new = t.elapsed();
             println!("{} files: serial {t_old:.2?}, parallel {t_new:.2?}", new.len());
             assert!(same(&new, &old));

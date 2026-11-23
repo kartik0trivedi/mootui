@@ -19,6 +19,7 @@ mod layout;
 mod library;
 mod media;
 mod plan;
+mod second;
 mod transfer;
 mod util;
 mod volumes;
@@ -62,6 +63,8 @@ struct Library {
     cfg: LibraryConfig,
     cat: Catalog,
     _lock: File,
+    /// Runs that never finished, found when the library was opened.
+    notice: Option<String>,
 }
 
 fn check_library_dir(root: &Path) -> Result<()> {
@@ -87,7 +90,27 @@ fn attach(root: &Path) -> Result<Library> {
         LibraryConfig::default().save(root)?;
     }
     let cfg = LibraryConfig::load(root);
-    Ok(Library { root: root.to_path_buf(), cfg, cat, _lock: lock })
+    let notice = interrupted_notice(&cat.close_interrupted()?);
+    Ok(Library { root: root.to_path_buf(), cfg, cat, _lock: lock, notice })
+}
+
+/// What to tell the user about runs that never finished.
+fn interrupted_notice(runs: &[catalog::Interrupted]) -> Option<String> {
+    let lines: Vec<String> = runs
+        .iter()
+        .map(|r| {
+            if r.kind == "import" {
+                let from = r.volume.clone().unwrap_or_else(|| tilde(Path::new(&r.source)));
+                format!(
+                    "The import from {from} started {} didn't finish. Import from it again to finish: files already in the library are skipped.",
+                    r.started
+                )
+            } else {
+                format!("The {} started {} didn't finish ({} move(s) made). Run it again to finish, or undo it.", r.kind, r.started, r.moves)
+            }
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +132,7 @@ struct Args {
     index: bool,
     second_copy: Option<PathBuf>,
     no_second_copy: bool,
+    catch_up: bool,
 }
 
 const HELP: &str = "mootui -- import photos into a catalogued library, skipping duplicates
@@ -123,6 +147,8 @@ usage:
   mootui --reorganize [--yes]               re-sort the whole library to its layout
   mootui --undo                             undo the last tidy/reorganize
   mootui --index                            build/refresh the catalog only
+  mootui --catch-up-second-copy [--second-copy DIR]
+                                            copy library files missing from the second copy
 
 The library defaults to ~/Pictures (change it in Settings or ~/.config/mootui/config.toml).
 Catalog and library settings live in <library>/.mootui/, logs in <library>/LOG/.";
@@ -145,6 +171,7 @@ fn parse_args() -> Result<Args> {
             "--index" => a.index = true,
             "--second-copy" => a.second_copy = Some(clean_typed_path(&it.next().unwrap_or_default())),
             "--no-second-copy" => a.no_second_copy = true,
+            "--catch-up-second-copy" => a.catch_up = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -161,7 +188,7 @@ fn main() -> Result<()> {
     let app_cfg = AppConfig::load();
     let root = args.library.clone().unwrap_or_else(|| app_cfg.library_path());
 
-    if args.plan_only || args.yes || args.tidy || args.reorganize || args.undo || args.index {
+    if args.plan_only || args.yes || args.tidy || args.reorganize || args.undo || args.index || args.catch_up {
         return headless(args, app_cfg, root);
     }
 
@@ -189,6 +216,9 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
     }
     // Holding `lib` keeps the library lock for the whole run.
     let lib = attach(&root)?;
+    if let Some(n) = &lib.notice {
+        eprintln!("note: {n}");
+    }
     let mut cfg = lib.cfg.clone();
     if args.trash {
         cfg.trash_duplicates = true;
@@ -201,6 +231,21 @@ fn headless(args: Args, app_cfg: AppConfig, root: PathBuf) -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
     let p = Progress::new(tx, Arc::new(AtomicBool::new(false)));
+
+    if args.catch_up {
+        let Some(sec) = args.second_copy.clone().or_else(|| app_cfg.second_copy_path()) else {
+            bail!("No second copy folder: set one in Settings or pass --second-copy DIR");
+        };
+        let (r, c) = (root.clone(), cfg.clone());
+        thread::spawn(move || {
+            let res = second::catch_up_library(&r, &c, &sec, &p).map_err(|e| format!("{e:#}"));
+            p.send(JobMsg::Info(res));
+        });
+        if let JobMsg::Info(r) = wait_job(&rx)? {
+            println!("{}", r.map_err(anyhow::Error::msg)?);
+        }
+        return Ok(());
+    }
 
     if args.index {
         let r = root.clone();
@@ -319,7 +364,12 @@ fn summary_line(s: &Summary) -> String {
         s.conflicts,
         if s.cancelled { " — CANCELLED" } else { "" }
     ) + &match &s.second {
-        Some(sec) => format!("; second copy in {} ({} failed)", tilde(sec), s.second_failed),
+        Some(sec) => format!(
+            "; second copy in {} ({} failed{})",
+            tilde(sec),
+            s.second_failed,
+            if s.second_caught_up > 0 { format!(", {} caught up", s.second_caught_up) } else { String::new() }
+        ),
         None => String::new(),
     }
 }
@@ -355,6 +405,7 @@ enum Entry {
     Tidy,
     Reorganize,
     Undo,
+    CatchUpSecond,
 }
 
 struct App {
@@ -492,11 +543,15 @@ impl App {
         match attach(&root) {
             Ok(lib) => {
                 self.dup_mode = lib.cfg.dup_mode();
+                let notice = lib.notice.clone();
                 self.lib = Some(lib);
                 if make_default {
                     self.app_cfg.library = tilde(&root);
                     let _ = self.app_cfg.save();
                     self.message = Some((format!("Library set to {} (now the default)", tilde(&root)), false));
+                }
+                if let Some(n) = notice {
+                    self.message = Some((n, true));
                 }
                 self.refresh_undo();
                 self.screen = Screen::Pick;
@@ -596,6 +651,15 @@ impl App {
         self.start_job(title, move |p| {
             let res = plan::plan_reconcile(&root, &cfg, kind, &p);
             p.send(JobMsg::Planned(res.map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    fn start_catch_up(&mut self) {
+        let Some(lib) = &self.lib else { return };
+        let Some(sec) = self.app_cfg.second_copy_path() else { return };
+        let (root, cfg) = (lib.root.clone(), lib.cfg.clone());
+        self.start_job("Catching up second copy", move |p| {
+            p.send(JobMsg::Info(second::catch_up_library(&root, &cfg, &sec, &p).map_err(|e| format!("{e:#}"))));
         });
     }
 
@@ -726,6 +790,9 @@ impl App {
         if self.undo_label.is_some() {
             e.push(Entry::Undo);
         }
+        if self.app_cfg.second_copy_path().is_some() {
+            e.push(Entry::CatchUpSecond);
+        }
         e
     }
 
@@ -844,6 +911,7 @@ impl App {
                 Entry::Tidy => self.start_reconcile(Kind::Tidy),
                 Entry::Reorganize => self.start_reconcile(Kind::Reorganize),
                 Entry::Undo => self.start_undo(),
+                Entry::CatchUpSecond => self.start_catch_up(),
             },
             _ => {}
         }
@@ -1180,6 +1248,14 @@ impl App {
                     Span::raw("  ↶ "),
                     Span::styled(self.undo_label.clone().unwrap_or_default(), Style::new().fg(Color::Yellow)),
                 ])),
+                Entry::CatchUpSecond => ListItem::new(Line::from(vec![
+                    Span::raw("  ◆ "),
+                    Span::styled("Catch up second copy", Style::new().bold()),
+                    Span::styled(
+                        format!("  copy library files missing from {}", self.app_cfg.second_copy_path().map(|p| tilde(&p)).unwrap_or_default()),
+                        Style::new().dark_gray(),
+                    ),
+                ])),
             })
             .collect();
 
@@ -1480,6 +1556,9 @@ impl App {
             }
             if s.warnings > 0 {
                 lines.push(Line::from(Span::styled(format!("  {} warning(s) — see log", s.warnings), Style::new().fg(Color::Yellow))));
+            }
+            if s.second_caught_up > 0 {
+                lines.push(Line::from(format!("  {} file(s) already in the library added to the second copy", s.second_caught_up)));
             }
             if let Some(sec) = &s.second {
                 let line = if s.second_failed > 0 {

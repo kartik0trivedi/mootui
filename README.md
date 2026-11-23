@@ -83,6 +83,7 @@ mootui --tidy [--yes] [--trash]          # sort loose files already in the libra
 mootui --reorganize [--yes]              # re-sort the whole library to the layout
 mootui --undo                            # undo the last tidy/reorganize
 mootui --index                           # build or refresh the catalog only
+mootui --catch-up-second-copy            # copy library files missing from the second copy
 mootui --library DIR ...                 # use a different library for this run
 ```
 
@@ -154,6 +155,8 @@ The extra backup folder holds catalog backups only. To keep a second copy of the
 - The import won't start if the folder is missing (for example, the drive isn't connected), overlaps the library or the source, or either disk lacks space for the import.
 - If a second copy fails, the file stays imported and the failure is reported as a warning. In move mode, a source file is deleted only after both copies are verified and flushed to disk.
 - A file already in the second copy with identical content counts as copied. One with different content is left alone and reported.
+- Files an import skips as already in the library are also checked against the second copy, and copied there from the library if they're missing. That covers a rerun after an interrupted import.
+- **Catch up second copy** (on the start screen, or `--catch-up-second-copy`) copies every library file missing from the second copy, reading from the library rather than a card. Use it after turning the second copy on for an existing library, or after second copies failed. Files already there count as present when their size matches; anything copied is verified.
 - The second copy has no catalog of its own. Tidy and Reorganize change only the library, so afterwards the second copy keeps the old layout.
 
 ## Performance
@@ -226,6 +229,9 @@ Other details:
 
 **Does mootui modify or delete files on my SD card?**
 Not by default; it copies. In move mode (`m` or `--move`) it deletes a source file only after the copy (and the second copy, if set) has been verified and flushed to disk.
+
+**What if an import is interrupted (the Mac sleeps, the card is pulled, mootui is killed)?**
+Import from the same card again. Files that reached the library are recognised as duplicates and skipped, and the rest are copied. A file is renamed into place only after it is verified, so the library never holds a half-copied photo; partial copies left behind are cleaned up automatically. The next time you open the library, mootui tells you which import didn't finish. With a second copy set, the rerun also fills in anything the second copy is missing.
 
 **Can I use it alongside Lightroom, Capture One or Apple Photos?**
 Yes. mootui writes ordinary folders. Point your editor at the library, or import from it. Tidy leaves already-sorted folders untouched.

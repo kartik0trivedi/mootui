@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/mootui-cow.svg" alt="mootui logo: a cross-eyed cow chewing on files" width="160">
+  <img src="docs/mootui-cow.svg" alt="mootui logo: a cross-eyed cow chewing on photos" width="160">
 </p>
 
 # mootui 

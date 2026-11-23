@@ -10,14 +10,18 @@
     <ellipse cx="188" cy="96" rx="15" ry="7" transform="rotate(25 188 96)" fill="#F4A6B8" stroke="none"/>
     <!-- head -->
     <path d="M120 44 C170 44 188 74 188 108 C188 140 172 160 120 160 C68 160 52 140 52 108 C52 74 70 44 120 44 Z" fill="#F7F5EF"/>
-    <!-- files being chewed: drawn behind the muzzle so half sits inside the mouth -->
-    <g transform="translate(176 168) rotate(62) translate(-20 -26)">
-      <path d="M0 0 H28 L40 12 V52 H0 Z" fill="#E6E9EE"/>
+    <!-- photos being chewed: drawn behind the muzzle so their left edges sit inside the mouth -->
+    <defs><clipPath id="photo"><rect width="50" height="38" rx="3"/></clipPath></defs>
+    <g transform="translate(182 158) rotate(-15) translate(-25 -19)">
+      <rect width="50" height="38" rx="3" fill="#FFFFFF"/>
     </g>
-    <g transform="translate(174 160) rotate(78) translate(-20 -26)">
-      <path d="M0 0 H28 L40 12 V52 H0 Z" fill="#FFFFFF"/>
-      <path d="M28 0 V12 H40" fill="none"/>
-      <path d="M8 22 H32 M8 31 H32 M8 40 H24" stroke="#9AA3AE" stroke-width="3.5"/>
+    <g transform="translate(180 164) rotate(-6) translate(-25 -19)">
+      <rect width="50" height="38" rx="3" fill="#FFFFFF"/>
+      <g clip-path="url(#photo)" stroke="none" fill="#141414">
+        <circle cx="29" cy="12" r="4.5"/>
+        <path d="M0 29 L13 20 L21 27 L37 12 L50 24 V38 H0 Z"/>
+      </g>
+      <rect width="50" height="38" rx="3" fill="none"/>
     </g>
     <!-- goofy cross-eyes: small low brow on the left, big raised brow on the right -->
     <circle cx="96" cy="110" r="15" fill="#FFFFFF"/>
